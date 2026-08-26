@@ -345,12 +345,18 @@ export interface BulkTrashResult {
 export function isProtectedSender(sender: string, protectedSenders: string[] | undefined): boolean {
   if (!sender || !protectedSenders || protectedSenders.length === 0) return false
   const lower = sender.toLowerCase()
+  // A felado gyakran "Nev <cim@domain>" boriteg-formatumban erkezik
+  // (decodeMimeHeader), ezert eloszor kinyerjuk a csupasz cimet. Enelkul a
+  // teljes cimes bejegyzes PONTOS egyezese elbukott a boritegre, es egy VEDETT
+  // felado levele torolhetove valt volna. (2026-08-26)
+  const angle = lower.match(/<([^>]+)>/)
+  const addr = angle ? angle[1].trim() : lower
   for (const raw of protectedSenders) {
     const p = raw.trim().toLowerCase()
     if (!p) continue
     if (p.includes('@')) {
-      // Full address: exact match (case-insensitive)
-      if (lower === p) return true
+      // Full address: a csupasz cimre egyezunk (boriteg-tolerans)
+      if (addr === p || lower === p) return true
     } else {
       // Domain-style: any "@<domain>" substring in the address qualifies.
       // "salonic.hu" matches "x@salonic.hu", "x@news.salonic.hu", "x@y.salonic.hu"

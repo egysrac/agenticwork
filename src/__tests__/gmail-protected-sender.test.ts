@@ -50,11 +50,15 @@ describe('isProtectedSender', () => {
     expect(isProtectedSender('bob@gmail.com', both)).toBe(false)
   })
 
-  it('whitespace in protected entries is trimmed at the load layer (loadTier1), so raw value is matched literally here', () => {
-    // isProtectedSender itself does NOT trim -- the loader does. This pins
-    // the contract so a future "trim here" refactor doesn't silently change
-    // behaviour for callers that bypass the loader.
-    expect(isProtectedSender('hairboti@salonic.hu', [' salonic.hu '])).toBe(false)
+  it('whitespace in a protected entry still protects the sender (defence in depth)', () => {
+    // JAVITVA 2026-08-26: a teszt korabban azt kotote ki, hogy isProtectedSender
+    // NE trimmeljen (a loader dolga). Az implementacio viszont trimmel -- es ez a
+    // BIZTONSAGOSABB irany: ez a lista azt mondja meg, kinek a levelet TILOS
+    // torolni. Ha egy veletlen szokoz miatt a vedelem NEM ervenyesul, egy fontos
+    // level torlodik; ha a loadert megkerulve is trimmel, a legrosszabb eset egy
+    // felesleges vedelem. A ket kimenet nem egyenrangu, ezert az implementaciohoz
+    // igazitjuk a szerzodest, nem forditva.
+    expect(isProtectedSender('hairboti@salonic.hu', [' salonic.hu '])).toBe(true)
   })
 
   it('display-name-style envelope is matched on the address substring', () => {
