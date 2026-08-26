@@ -730,7 +730,22 @@ async function attemptFireTask(
       // down still uses ALLOWED_CHAT_ID by design.
       const boundChatId = resolveBoundChatId(agentName)
       if (boundChatId) {
-        prefix = `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el Telegramon (chat_id: ${boundChatId}, reply tool). `
+        // The main agent (jarvis) has NO working native-channels "reply tool":
+        // the plugin's telegram MCP server requires claude.ai OAuth
+        // (Kq()?.accessToken) to register at all, which this MiniMax/API-key
+        // fleet never has -- confirmed by reading the Claude Code CLI's e58()
+        // gate directly (2026-08-21). Telling jarvis to use a "reply tool"
+        // that structurally cannot exist here is why reggeli-napindito and
+        // other scheduled tasks silently never arrived even after boundChatId
+        // resolution was fixed. jarvis's own CLAUDE.md already documents the
+        // sanctioned fallback ("kulon kuldeshez a Telegram Bot API hasznalhato"):
+        // a direct Bot API call using the bridge's token from marveen/.env.
+        // Sub-agents are left on the "reply tool" wording for now since their
+        // channel setup differs per-agent and hasn't been confirmed broken the
+        // same way; revisit if/when they get their own curl-based bridges.
+        prefix = agentName === MAIN_AGENT_ID
+          ? `[Utemezett feladat: ${task.name}] Nincs mukodo Telegram "reply tool" -- az OAuth-ot igenylo natív channels plugin ezen a MiniMax-flottan nem tud csatlakozni. Az eredmenyt Bot API curl hivassal kuldd el: TOKEN=$(grep TELEGRAM_BOT_TOKEN /home/alex/marveen/.env | cut -d= -f2) && curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" -d "chat_id=${boundChatId}" --data-urlencode "text=A SZOVEG" > /dev/null. `
+          : `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el Telegramon (chat_id: ${boundChatId}, reply tool). `
       } else {
         logger.warn({ task: task.name, agent: agentName }, 'scheduled task: agent has no bound telegram chat (access.json missing/empty) -- prompt omits the Telegram delivery instruction')
         prefix = `[Utemezett feladat: ${task.name}] `

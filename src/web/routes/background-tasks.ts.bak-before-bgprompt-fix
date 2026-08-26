@@ -1,8 +1,5 @@
 import { randomBytes } from 'node:crypto'
 import { execSync, execFileSync } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import {
   createBackgroundTaskAtomic, finishBackgroundTask, getBackgroundTasks,
   getBackgroundTask, getRunningBackgroundTasks, markOrphanedTasksFailed,
@@ -57,18 +54,10 @@ export function spawnBackgroundTask(agentId: string, prompt: string): Background
     return { error: `Maximum ${MAX_CONCURRENT} egyidejű háttérfeladat ágensenként.` }
   }
 
-  // A promptot FAJLON at adjuk at, nem kornyezeti valtozoban. A `tmux new-session`
-  // a mar futo tmux SZERVERrel hozza letre a sessiont, ami a hivo env-jet (es igy a
-  // BG_PROMPT-ot) NEM orokli -> a "$BG_PROMPT" uresre oldodott, es minden
-  // hattermunka azonnal elhasalt ezzel: "Input must be provided either through
-  // stdin or as a prompt argument". (2026-08-21)
-  const promptFile = join(tmpdir(), `bg-prompt-${id}.txt`)
-  writeFileSync(promptFile, prompt, { mode: 0o600 })
   const shellCmd = [
     `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH"`,
-    `cat ${promptFile} | ${CLAUDE} -p --output-format text 2>&1`,
-    `rm -f ${promptFile}`,
-  ].join('; ')
+    `${CLAUDE} -p "$BG_PROMPT" --output-format text 2>&1`,
+  ].join(' && ')
 
   try {
     execFileSync(TMUX, [

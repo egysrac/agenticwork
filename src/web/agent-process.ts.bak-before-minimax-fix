@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, symlinkSync, rmSync, realpathSync, renameSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { execFileSync } from 'node:child_process'
+import { execSync, execFileSync } from 'node:child_process'
 import { OLLAMA_URL } from '../config.js'
 import { makeLazyBinResolver } from '../platform.js'
 import { logger } from '../logger.js'
@@ -47,7 +47,7 @@ import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT, SUBAGENT_INBO
 import { getEffectiveSettingValue } from '../settings-store.js'
 import { loadProfileTemplate } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
-import { writeAgentSettingsFromProfile, ensureFleetRosterSection, ensureAutonomySection, ensureSkillsPathTrapSection } from './agent-scaffold.js'
+import { writeAgentSettingsFromProfile, ensureFleetRosterSection, ensureAutonomySection } from './agent-scaffold.js'
 import { schedulePluginUnlockAfterRespawn } from './channel-plugin-unlock.js'
 import { getSecret } from './vault.js'
 import { resolveOpenRouterModel } from './openrouter-models.js'
@@ -979,7 +979,7 @@ function startRemoteAgentProcess(
   }
 }
 
-export async function startAgentProcess(name: string, opts: { fresh?: boolean } = {}): Promise<{ ok: boolean; pid?: number; error?: string }> {
+export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}): { ok: boolean; pid?: number; error?: string } {
   const dir = agentDir(name)
   if (!existsSync(dir)) return { ok: false, error: 'Agent not found' }
 
@@ -1047,7 +1047,7 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
   try {
     try {
       runTmux(null, ['kill-session', '-t', session])
-      await delay(3000)
+      execSync('sleep 3', { timeout: 5000 })
     } catch { /* ok */ }
 
     // Reap any orphan poller (bun/node) left over from a previous run BEFORE
@@ -1084,14 +1084,8 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     const isDeepseek = model.startsWith('deepseek-')
     // OpenRouter model ids are `provider/model` (contain '/'); Ollama tags use
     // ':' and no '/'. This discriminator keeps OpenRouter ids off the Ollama path.
-    // MiniMax: sajat ag. Enelkul a lenti `isOllama` catch-all magaba szivja
-    // (minden nem-claude/deepseek/openrouter modellt Ollamanak feltetelez), es az
-    // agens ANTHROPIC_BASE_URL=<ollama>-t kap -> "There's an issue with the
-    // selected model (MiniMax-M3)". A base_url-t es a kulcsot a telepites sajat
-    // .env-jebol vesszuk (a dashboard process.env-jeben ott van). (2026-08-21)
-    const isMiniMax = !isClaude && !isDeepseek && /^minimax/i.test(model)
-    const isOpenRouter = !isClaude && !isDeepseek && !isMiniMax && model.includes('/')
-    const isOllama = !isClaude && !isDeepseek && !isMiniMax && !isOpenRouter
+    const isOpenRouter = !isClaude && !isDeepseek && model.includes('/')
+    const isOllama = !isClaude && !isDeepseek && !isOpenRouter
     // ANTHROPIC_MODEL is REQUIRED for non-Claude models: the interactive TUI
     // validates the `--model` flag against known Anthropic models and silently
     // falls back to the built-in default (claude-opus-...) for an unrecognized
@@ -1100,11 +1094,6 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // authoritative and bypasses that validation. (`--print` honors --model, but
     // the agents run the TUI.) Single-quoted so a `:` in the tag is shell-safe.
     const ollamaEnv = isOllama ? `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${OLLAMA_URL} && export ANTHROPIC_MODEL=${shSingleQuote(model)} && ` : ''
-    const minimaxBase = process.env['ANTHROPIC_BASE_URL'] ?? ''
-    const minimaxKey = process.env['ANTHROPIC_AUTH_TOKEN'] ?? ''
-    const minimaxEnv = isMiniMax && minimaxBase && minimaxKey
-      ? `export ANTHROPIC_AUTH_TOKEN="${minimaxKey}" && export ANTHROPIC_BASE_URL=${minimaxBase} && export ANTHROPIC_MODEL=${shSingleQuote(model)} && `
-      : ''
     const deepseekKey = isDeepseek ? (getSecret('DEEPSEEK_API_KEY') ?? '') : ''
     const deepseekEnv = isDeepseek ? `export ANTHROPIC_AUTH_TOKEN="${deepseekKey}" && export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic && export ANTHROPIC_MODEL=${shSingleQuote(model)} && ` : ''
     // OpenRouter: Anthropic-compatible endpoint at https://openrouter.ai/api
@@ -1133,7 +1122,6 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     writeAgentSettingsFromProfile(name, profile)
     ensureFleetRosterSection(name)
     ensureAutonomySection(name)
-    ensureSkillsPathTrapSection(name)
     // A sub-agent must load ONLY its own channel plugin. The user-scope
     // enabledPlugins would otherwise make EVERY sub-agent spawn a telegram
     // (and slack/discord) poller that falls back to the main agent's bot
@@ -1386,7 +1374,7 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // values like `claude-opus-4-8[1m]` (1M-context suffix) from being glob-expanded AND makes a `'`
     // in the value inert rather than a quote-break -> command injection. Same escape at the three
     // ANTHROPIC_MODEL env sites above.
-    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${autoUpdaterEnv}${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${minimaxEnv}${ollamaEnv}${deepseekEnv}${openrouterEnv}cd "${dir}" && ${claudeBin()} ${continueFlag}${skipFlag}--model ${shSingleQuote(model)} ${channelFlag}`.trimEnd()
+    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${autoUpdaterEnv}${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${ollamaEnv}${deepseekEnv}${openrouterEnv}cd "${dir}" && ${claudeBin()} ${continueFlag}${skipFlag}--model ${shSingleQuote(model)} ${channelFlag}`.trimEnd()
     runTmux(null, ['new-session', '-d', '-s', session, cmd], { timeout: 10000 })
 
     logger.info({ name, session, channelDir: agentChannelDir }, 'Agent tmux session started')
@@ -1431,7 +1419,7 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
   }
 }
 
-export async function stopAgentProcess(name: string): Promise<{ ok: boolean; error?: string }> {
+export function stopAgentProcess(name: string): { ok: boolean; error?: string } {
   const session = agentSessionName(name)
   if (!isAgentRunning(name)) return { ok: false, error: 'Agent is not running' }
 
@@ -1439,7 +1427,7 @@ export async function stopAgentProcess(name: string): Promise<{ ok: boolean; err
 
   try {
     runTmux(host, ['kill-session', '-t', session], { timeout: 5000 })
-    await delay(2000)
+    execSync('sleep 2', { timeout: 4000 })
     // Reap any orphaned plugin grandchild that tmux did not tear down. This is
     // a LOCAL pkill against this host's process table, so it only makes sense
     // for local agents; a remote agent is channel-less and its processes live
@@ -1470,9 +1458,9 @@ export function getAgentProcessInfo(name: string): { running: boolean; session?:
   }
 }
 
-export async function restartAgentProcess(name: string, opts: { fresh?: boolean } = {}): Promise<{ ok: boolean; pid?: number; error?: string }> {
+export function restartAgentProcess(name: string, opts: { fresh?: boolean } = {}): { ok: boolean; pid?: number; error?: string } {
   if (isAgentRunning(name)) {
-    const stopResult = await stopAgentProcess(name)
+    const stopResult = stopAgentProcess(name)
     if (!stopResult.ok) return { ok: false, error: stopResult.error || 'Failed to stop running agent before restart' }
   }
   return startAgentProcess(name, opts)

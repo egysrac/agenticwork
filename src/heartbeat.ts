@@ -4,7 +4,6 @@ import { homedir, userInfo } from 'node:os'
 import { execFileSync } from 'node:child_process'
 import { getEffectiveSettingValue } from './settings-store.js'
 import {
-  HEARTBEAT_CALENDAR_ID,
   STORE_DIR,
   DB_FILENAME,
   PROJECT_ROOT,
@@ -12,7 +11,7 @@ import {
   APP_TZ,
 } from './config.js'
 import { getHeartbeatKanbanSummary, getActiveScheduledTaskCount } from './db.js'
-import { getCalendarEvents, type CalendarEvent } from './google-api.js'
+import { getEvents as getCalendarEvents, type CalendarEvent } from './icloud-caldav.js'
 import { runAgent } from './agent.js'
 import { notifyTelegram } from './notify.js'
 import { logger } from './logger.js'
@@ -301,15 +300,32 @@ interface HeartbeatData {
 
 // --- Data collection ---
 
+// Heartbeat pulls from the two "alap" iCloud calendars. If one fails the
+// other still surfaces -- Promise.allSettled rather than a single throw,
+// because a transient CalDAV 503 on one calendar should not silently drop
+// the other. CALBASECAL1: a single-calendar setup hid an Apple-side outage
+// of the default calendar (2026-07-12, 4 days) because the catch returned
+// []. Two-calendar fetch with partial-success surfaces any outage within one
+// heartbeat cycle instead of four.
+const HEARTBEAT_BASE_CALENDARS = ['Személyes', 'Család']
+
 async function collectCalendar(): Promise<CalendarEvent[]> {
-  try {
-    const now = new Date()
-    const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60 * 1000)
-    return await getCalendarEvents(HEARTBEAT_CALENDAR_ID, now, twoHoursLater)
-  } catch (err) {
-    logger.error({ err }, 'Heartbeat: calendar fetch failed')
-    return []
+  const now = new Date()
+  const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60 * 1000)
+  const results = await Promise.allSettled(
+    HEARTBEAT_BASE_CALENDARS.map(name =>
+      getCalendarEvents(name, now, twoHoursLater)),
+  )
+  const events: CalendarEvent[] = []
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i]
+    if (r.status === 'fulfilled') {
+      events.push(...r.value)
+    } else {
+      logger.error({ err: r.reason, calendar: HEARTBEAT_BASE_CALENDARS[i] }, 'Heartbeat: calendar fetch failed')
+    }
   }
+  return events
 }
 
 /** Label a card for the heartbeat prompt: `[ID] title`, title truncated.

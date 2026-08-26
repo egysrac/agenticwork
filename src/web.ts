@@ -30,6 +30,7 @@ import { startAutoRestartRunner } from './web/auto-restart-runner.js'
 import { startModelFallbackRunner } from './web/model-fallback-runner.js'
 import { startContextGuardRunner } from './web/context-guard-runner.js'
 import { startContextRestartGateRunner } from './web/context-restart-gate-runner.js'
+import { startGmailCleanupRunner } from './web/gmail-cleanup-runner.js'
 import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
 import { tryHandleAuth } from './web/routes/auth.js'
@@ -49,6 +50,7 @@ import { tryHandleDailyLog } from './web/routes/daily-log.js'
 import { tryHandleMemories } from './web/routes/memories.js'
 import { tryHandleMigrate } from './web/routes/migrate.js'
 import { tryHandleKanban } from './web/routes/kanban.js'
+import { tryHandleGmail } from './web/routes/gmail.js'
 import { tryHandleSchedules } from './web/routes/schedules.js'
 import { tryHandleConnectors } from './web/routes/connectors.js'
 import { tryHandleDocs } from './web/routes/docs.js'
@@ -183,6 +185,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleMemories(routeCtx)) return
       if (await tryHandleMigrate(routeCtx)) return
       if (await tryHandleKanban(routeCtx)) return
+      if (await tryHandleGmail(routeCtx)) return
       if (await tryHandleSchedules(routeCtx)) return
       if (await tryHandleConnectorsHu(routeCtx)) return
       if (await tryHandleConnectors(routeCtx)) return
@@ -390,6 +393,13 @@ export function startWebServer(port = 3420): http.Server {
   const costsSyncInterval = webOnly ? undefined : startCostsSyncTask()
   if (!webOnly) logger.info('CostOps fixed-cost sync started (10min poll + startup)')
 
+  // Gmail weekly cleanup -- trashes unread messages older than 14 days, but
+  // never touches a Tier 1 protected-sender allowlist. Catches the backlog
+  // before it grows unbounded. Fail-closed: if the tier1 config is missing
+  // or empty, the runner skips its run entirely.
+  const gmailCleanup = webOnly ? undefined : startGmailCleanupRunner()
+  if (!webOnly) logger.info('Gmail cleanup runner started (weekly Friday 02:57)')
+
   const stuckInputInterval = webOnly ? undefined : startStuckInputWatcher()
   if (!webOnly) logger.info('Stuck-input watcher started (15s poll, 20s offset)')
 
@@ -579,6 +589,7 @@ export function startWebServer(port = 3420): http.Server {
     clearInterval(modelFallbackInterval)
     clearInterval(contextGuardInterval)
     clearInterval(approvalTimeoutInterval)
+    if (gmailCleanup) gmailCleanup.stop()
     clearInterval(authSessionSweepInterval)
     clearInterval(updateCheckerInterval)
     if (federationPollerInterval) clearInterval(federationPollerInterval)
