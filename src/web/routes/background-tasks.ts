@@ -64,16 +64,37 @@ export function spawnBackgroundTask(agentId: string, prompt: string): Background
   // stdin or as a prompt argument". (2026-08-21)
   const promptFile = join(tmpdir(), `bg-prompt-${id}.txt`)
   writeFileSync(promptFile, prompt, { mode: 0o600 })
+  // A tmux SZERVER env-je NEM a dashboarde, ezert a modell-valtozokat a
+  // parancsnak maganak kell exportalnia -- kulonben a claude hitelesites nelkul
+  // indul ("Not logged in - Please run /login") es a feladat kimenet nelkul
+  // veget er. (2026-08-26)
+  const MODEL_ENV_KEYS = [
+    'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY',
+    'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  ]
+  const modelEnv = MODEL_ENV_KEYS
+    .filter((k) => process.env[k])
+    .map((k) => `export ${k}='${String(process.env[k]).replace(/'/g, "'\\''")}'`)
+    .join(' && ')
   const shellCmd = [
     `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH"`,
-    `cat ${promptFile} | ${CLAUDE} -p --output-format text 2>&1`,
+    ...(modelEnv ? [modelEnv] : []),
+    // --dangerously-skip-permissions: `-p` modban senki nem tud jovahagyni egy
+    // permission promptot, igy nelkule minden erdemi hattermunka elakad. A
+    // flotta minden mas sessionje (fo agens, workerek, sub-agensek) is igy fut.
+    `cat ${promptFile} | ${CLAUDE} -p --dangerously-skip-permissions --output-format text 2>&1`,
     `rm -f ${promptFile}`,
   ].join('; ')
 
   try {
     execFileSync(TMUX, [
       'new-session', '-d', '-s', session, '-x', '200', '-y', '50',
-      `${shellCmd}; echo '___BG_DONE___'; sleep 5`,
+      // A poller 10 mp-enkent nez ra, es ELOSZOR azt vizsgalja, el-e a
+      // session; ha nem, "(session ended)"-et ir a valodi kimenet helyett.
+      // 5 mp turelem mellett ez versenyhelyzet volt. 60 mp = legalabb 5
+      // lekerdezes biztosan latja a jelzot. (2026-08-26)
+      `${shellCmd}; echo '___BG_DONE___'; sleep 60`,
     ], {
       timeout: 5000,
       env: { ...process.env, BG_PROMPT: prompt },
