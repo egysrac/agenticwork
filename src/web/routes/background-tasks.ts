@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { execSync, execFileSync } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
+import { writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -23,6 +23,27 @@ const TZ = APP_TZ  // install zone (config.APP_TZ); was hardcoded Europe/Budapes
 
 function bgSessionName(id: string): string {
   return `bg-${id}`
+}
+
+// MODEL_ENV_KEYS: azok a kornyezeti valtozok, amiket a tmux session-ben futo
+// `claude -p` feltetlenul latnia kell. A tmux SZERVER env-jet orokli (ami a
+// szerver indulaskor rogzult), nem a klienset -- ezert ezeket a parancsban
+// explicit exportaljuk. (BGPMODE826)
+const MODEL_ENV_KEYS = [
+  'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY',
+  'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+]
+
+// buildModelEnv: a process.env-bol kinyeri a MODEL_ENV_KEYS-ben felsorolt
+// valtozokat, es egy `export K='V' && export K2='V2' && ...` lancot epit
+// beloluk (shell-biztos escape-pel). Ha nincs egyetlen sem, ures stringet ad.
+// EXPORTALT, hogy a tesztek kozvetlenul tudjak vizsgalni a kimenetet.
+export function buildModelEnv(env: NodeJS.ProcessEnv = process.env): string {
+  return MODEL_ENV_KEYS
+    .filter((k) => env[k])
+    .map((k) => `export ${k}='${String(env[k]).replace(/'/g, "'\\''")}'`)
+    .join(' && ')
 }
 
 function isBgSessionAlive(session: string): boolean {
@@ -48,6 +69,23 @@ function killSession(session: string): void {
   } catch { /* already dead */ }
 }
 
+// FÁJL-ALAPÚ OUTPUT (2026-08-26): a kimenet es a `___BG_DONE___` marker a
+// `bg-output-${id}.txt` fajlba irodik (a tmux pane helyett). A poller innen
+// olvas, NEM a captureSession-bol -- igy a session lifecycle es az output
+// capture SZET VAN VALASZTVA. A korabbi 5s/60s sleep ablak azert kellett,
+// mert a captureSession csak elo sessionbol tudott olvasni, es ha a session
+// idokozben meghalt, a marker elveszett. Fajl eseten nincs ilyen race: a fajl
+// megmarad a session halal utan is, a poller es a startup sweep is olvashatja.
+function readOutputFile(id: string): string | null {
+  const file = join(tmpdir(), `bg-output-${id}.txt`)
+  if (!existsSync(file)) return null
+  try {
+    return readFileSync(file, 'utf-8')
+  } catch {
+    return null
+  }
+}
+
 export function spawnBackgroundTask(agentId: string, prompt: string): BackgroundTask | { error: string } {
   const id = randomBytes(4).toString('hex').toUpperCase()
   const session = bgSessionName(id)
@@ -63,38 +101,31 @@ export function spawnBackgroundTask(agentId: string, prompt: string): Background
   // hattermunka azonnal elhasalt ezzel: "Input must be provided either through
   // stdin or as a prompt argument". (2026-08-21)
   const promptFile = join(tmpdir(), `bg-prompt-${id}.txt`)
+  const outputFile = join(tmpdir(), `bg-output-${id}.txt`)
   writeFileSync(promptFile, prompt, { mode: 0o600 })
-  // A tmux SZERVER env-je NEM a dashboarde, ezert a modell-valtozokat a
-  // parancsnak maganak kell exportalnia -- kulonben a claude hitelesites nelkul
-  // indul ("Not logged in - Please run /login") es a feladat kimenet nelkul
-  // veget er. (2026-08-26)
-  const MODEL_ENV_KEYS = [
-    'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY',
-    'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
-    'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  ]
-  const modelEnv = MODEL_ENV_KEYS
-    .filter((k) => process.env[k])
-    .map((k) => `export ${k}='${String(process.env[k]).replace(/'/g, "'\\''")}'`)
-    .join(' && ')
+  const modelEnv = buildModelEnv()
   const shellCmd = [
     `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH"`,
     ...(modelEnv ? [modelEnv] : []),
     // --dangerously-skip-permissions: `-p` modban senki nem tud jovahagyni egy
     // permission promptot, igy nelkule minden erdemi hattermunka elakad. A
     // flotta minden mas sessionje (fo agens, workerek, sub-agensek) is igy fut.
-    `cat ${promptFile} | ${CLAUDE} -p --dangerously-skip-permissions --output-format text 2>&1`,
+    // Fajl-alapu output: a stdout+stderr a `bg-output-${id}.txt`-be megy, es a
+    // marker is oda irodik (a tmux pane helyett). Igy a poller a session
+    // lifecycle-jatol fuggetlenul tudja olvasni a vegeredmenyt.
+    `{ cat ${promptFile} | ${CLAUDE} -p --dangerously-skip-permissions --output-format text; echo '___BG_DONE___'; } > ${outputFile} 2>&1`,
     `rm -f ${promptFile}`,
+    // A 30s sleep azert kell, hogy a tmux session meg elo legyen egy darabig
+    // a feladat vege utan -- ezalatt a live output capture meg elmegy a
+    // dashboardon (captureSession). Nem race-kritikus: a fajl akkor is ott
+    // van, ha a session idokozben meghal.
+    `sleep 30`,
   ].join('; ')
 
   try {
     execFileSync(TMUX, [
       'new-session', '-d', '-s', session, '-x', '200', '-y', '50',
-      // A poller 10 mp-enkent nez ra, es ELOSZOR azt vizsgalja, el-e a
-      // session; ha nem, "(session ended)"-et ir a valodi kimenet helyett.
-      // 5 mp turelem mellett ez versenyhelyzet volt. 60 mp = legalabb 5
-      // lekerdezes biztosan latja a jelzot. (2026-08-26)
-      `${shellCmd}; echo '___BG_DONE___'; sleep 60`,
+      `${shellCmd}`,
     ], {
       timeout: 5000,
       env: { ...process.env, BG_PROMPT: prompt },
@@ -121,22 +152,14 @@ function pollUntilDone(id: string): void {
       return
     }
 
-    const session = task.tmux_session
-    if (!session) { clearInterval(interval); return }
-
-    if (!isBgSessionAlive(session)) {
-      const output = '(session ended)'
+    // Fajl-alapu olvasas: ha a marker megvan a fajlban, a feladat vegezte --
+    // fuggetlenul attol, hogy a tmux session meg elo-e vagy mar meghalt.
+    // (2026-08-26, BGPMODE826 refaktor)
+    const fileOut = readOutputFile(id)
+    if (fileOut !== null && fileOut.includes('___BG_DONE___')) {
+      const output = fileOut.replace(/___BG_DONE___[\s\S]*$/, '').trim()
       finishBackgroundTask(id, 'done', output)
-      logger.info({ id }, 'Background task session ended')
-      clearInterval(interval)
-      return
-    }
-
-    const pane = captureSession(session)
-    if (pane && pane.includes('___BG_DONE___')) {
-      const output = pane.replace(/___BG_DONE___[\s\S]*$/, '').trim()
-      finishBackgroundTask(id, 'done', output)
-      killSession(session)
+      if (task.tmux_session) killSession(task.tmux_session)
       logger.info({ id }, 'Background task completed')
       clearInterval(interval)
     }
@@ -147,9 +170,19 @@ function checkAndFinalize(id: string): void {
   const task = getBackgroundTask(id)
   if (!task || task.status !== 'running') return
 
+  // Timeout-nal is a fajlbol olvasunk -- igy ha a 30 perc alatt vegzett a
+  // task, de a poller valamiert lemaradt, meg megvan a tenyleges kimenet.
+  const fileOut = readOutputFile(id)
   const session = task.tmux_session
-  const output = session ? captureSession(session) : null
-  finishBackgroundTask(id, 'timeout', output?.trim() || '(timeout)')
+  if (fileOut !== null && fileOut.includes('___BG_DONE___')) {
+    const clean = fileOut.replace(/___BG_DONE___[\s\S]*$/, '').trim()
+    finishBackgroundTask(id, 'done', clean)
+    if (session) killSession(session)
+    logger.warn({ id }, 'Background task already done before 30min timeout (poller missed it)')
+    return
+  }
+  const tmuxOut = session ? captureSession(session) : null
+  finishBackgroundTask(id, 'timeout', tmuxOut?.trim() || fileOut?.trim() || '(timeout)')
   if (session) killSession(session)
   logger.warn({ id }, 'Background task timed out after 30 minutes')
 }
@@ -159,9 +192,18 @@ export function sweepOrphanedBackgroundTasks(): void {
   let orphaned = 0
   for (const task of running) {
     if (!task.tmux_session || !isBgSessionAlive(task.tmux_session)) {
-      const output = task.tmux_session ? captureSession(task.tmux_session) : null
-      finishBackgroundTask(task.id, 'failed', output?.trim() || '(orphaned on restart)')
-      orphaned++
+      // Ha a session meghalt, megnezzuk a fajlt -- ha abban megvan a marker,
+      // a feladat valojaban kesz volt, csak a poller maradt le. (BGPMODE826)
+      const fileOut = readOutputFile(task.id)
+      if (fileOut !== null && fileOut.includes('___BG_DONE___')) {
+        const clean = fileOut.replace(/___BG_DONE___[\s\S]*$/, '').trim()
+        finishBackgroundTask(task.id, 'done', clean)
+        logger.info({ id: task.id }, 'Recovered completed background task from output file on sweep')
+      } else {
+        const tmuxOut = task.tmux_session ? captureSession(task.tmux_session) : null
+        finishBackgroundTask(task.id, 'failed', tmuxOut?.trim() || fileOut?.trim() || '(orphaned on restart)')
+        orphaned++
+      }
     } else {
       setTimeout(() => checkAndFinalize(task.id), TIMEOUT_MS)
       pollUntilDone(task.id)
@@ -216,7 +258,9 @@ export async function tryHandleBackgroundTasks(ctx: RouteContext): Promise<boole
 
     let liveOutput: string | null = null
     if (task.status === 'running' && task.tmux_session) {
-      liveOutput = captureSession(task.tmux_session)
+      // captureSession az elsodleges (friss, sorrol-sorra frissul a tmux
+      // pane-bol); a fajl a fallback, ha a session mar meghalt. (BGPMODE826)
+      liveOutput = captureSession(task.tmux_session) || readOutputFile(task.id)
     }
 
     json(res, {
@@ -231,11 +275,21 @@ export async function tryHandleBackgroundTasks(ctx: RouteContext): Promise<boole
   if (taskMatch && method === 'DELETE') {
     const task = getBackgroundTask(taskMatch[1])
     if (!task) { json(res, { error: 'Háttérfeladat nem található' }, 404); return true }
-    const output = task.tmux_session ? captureSession(task.tmux_session) : null
+    // Fajl-elsobbség a cancelnel: ha a task idokozben befejezodott es a
+    // marker megvan a fajlban, ne veszitsuk el a kimenetet egy cancel miatt.
+    // (BGPMODE826)
+    const fileOut = readOutputFile(task.id)
+    const tmuxOut = task.tmux_session ? captureSession(task.tmux_session) : null
     if (task.status === 'running' && task.tmux_session) {
       killSession(task.tmux_session)
     }
-    finishBackgroundTask(task.id, 'failed', output?.trim() || '(cancelled)')
+    if (fileOut !== null && fileOut.includes('___BG_DONE___')) {
+      const clean = fileOut.replace(/___BG_DONE___[\s\S]*$/, '').trim()
+      finishBackgroundTask(task.id, 'done', clean)
+    } else {
+      const output = tmuxOut?.trim() || fileOut?.trim() || '(cancelled)'
+      finishBackgroundTask(task.id, 'failed', output)
+    }
     json(res, { ok: true })
     return true
   }
