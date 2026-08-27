@@ -122,13 +122,48 @@ export async function tryHandleGmail(ctx: RouteContext): Promise<boolean> {
       return true
     }
 
-    // Bulk-trash by criteria. Used by the email-triage pipeline: nightly
-    // job passes { beforeDays: 14, unreadOnly: true } to clear the backlog.
-    // Returns the count + matched UIDs so the caller can audit what got hit.
+    // Bulk-modify by Gmail query (TRASH826 path). Takes a Gmail query string
+    // (e.g. "category:promotions older_than:7d") and applies the requested
+    // label changes in a single batchModify call. The runner handles the
+    // TRASH + MARK-READ use cases; the dashboard / dashboard-tools use this
+    // for ad-hoc sweeps.
     //
-    // `protectedSenders`: optional list of email/domain strings to NEVER
-    // trash. Match is substring on domain-style entries, exact on full
-    // addresses (case-insensitive). Back-compat: omit/empty = no protection.
+    // `addLabelIds` / `removeLabelIds` -- Gmail label IDs (e.g. "TRASH",
+    // "INBOX", "UNREAD"). Empty arrays are allowed; the call is a no-op.
+    // `protectCategoryPrimary` defaults to true: any id whose labelIds include
+    // CATEGORY_PRIMARY / CATEGORY_PERSONAL is filtered out before the
+    // batchModify. Set false to opt out (only do this for read-only label
+    // changes like UNREAD, where a sweep is harmless).
+    // `protectedSenders` -- optional substring/exact-match list (domain-style
+    // entries match on "@<domain>", full addresses match exact). Matched
+    // senders are dropped from the batch.
+    if (path === '/api/gmail/bulk-modify-by-query' && method === 'POST') {
+      const body = parseJsonBody<{
+        query?: string
+        addLabelIds?: string[]
+        removeLabelIds?: string[]
+        maxCount?: number
+        protectCategoryPrimary?: boolean
+        protectedSenders?: string[]
+      }>(await readBody(ctx.req))
+      if (typeof body.query !== 'string' || body.query.length === 0) {
+        json(res, { error: 'query (non-empty string) required' }, 400)
+        return true
+      }
+      const result = await gmail.bulkModifyByQuery(body.query, {
+        addLabelIds: body.addLabelIds ?? [],
+        removeLabelIds: body.removeLabelIds ?? [],
+        maxCount: body.maxCount ?? 500,
+        protectCategoryPrimary: body.protectCategoryPrimary !== false,
+        protectedSenders: body.protectedSenders,
+      })
+      json(res, result)
+      return true
+    }
+
+    // Legacy alias kept for one release cycle: POST /api/gmail/bulk-trash
+    // translates the old shape (beforeDays/unreadOnly/fromContains) into a
+    // Gmail query and forwards to bulkModifyByQuery with TRASH/INBOX.
     if (path === '/api/gmail/bulk-trash' && method === 'POST') {
       const body = parseJsonBody<{
         beforeDays?: number
@@ -141,12 +176,14 @@ export async function tryHandleGmail(ctx: RouteContext): Promise<boolean> {
         json(res, { error: 'beforeDays (positive number) required' }, 400)
         return true
       }
-      const before = new Date(Date.now() - body.beforeDays * 24 * 60 * 60 * 1000)
-      const result = await gmail.bulkTrash({
-        before,
-        unreadOnly: body.unreadOnly !== false,
-        fromContains: body.fromContains,
+      const parts: string[] = [`older_than:${body.beforeDays}d`]
+      if (body.unreadOnly !== false) parts.push('is:unread')
+      if (body.fromContains) parts.push(`from:${body.fromContains}`)
+      const result = await gmail.bulkModifyByQuery(parts.join(' '), {
+        addLabelIds: ['TRASH'],
+        removeLabelIds: ['INBOX'],
         maxCount: body.maxCount ?? 500,
+        protectCategoryPrimary: true,
         protectedSenders: body.protectedSenders,
       })
       json(res, result)
