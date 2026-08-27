@@ -168,7 +168,10 @@ async function parseSourceToBodies(source: Buffer): Promise<{ text?: string; htm
 // ("=?UTF-8?B?...?=") for subject, or a parsed object/array ({ name, mailbox,
 // host, ... }) for address fields. Coerce non-strings before applying RFC 2047
 // decoding so the rest of the pipeline always sees a string.
-function decodeMimeHeader(value: any): string {
+// EXPORTALT (2026-08-26): az integrációs tesztek a teljes fetchEnvelopeFrom
+// -> isProtectedSender lancot zart lancban tesztelik, es ehhez szukseguk van
+// ra (GMAILENV826 regression test).
+export function decodeMimeHeader(value: any): string {
   if (value === null || value === undefined) return ''
   if (typeof value !== 'string') {
     if (Array.isArray(value)) {
