@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import Database from 'better-sqlite3'
+import { buildModelEnv } from '../web/routes/background-tasks.js'
 
 describe('background_tasks schema and CRUD', () => {
   let db: ReturnType<typeof Database>
@@ -162,5 +163,104 @@ describe('background-tasks route ID regex', () => {
     expect(re.test('/api/background-tasks/ABCD12345')).toBe(false)
     expect(re.test('/api/background-tasks/abcd1234')).toBe(false)
     expect(re.test('/api/background-tasks/')).toBe(false)
+  })
+})
+
+// BGPMODE826 unit-tesztek: a modelEnv építő függvény viselkedése. A függvény
+// azert kulon exportalva, hogy a shell-biztos escapelest es a szurest
+// kozvetlenul tesztelhessuk, tmux szerver inditasa nelkul.
+describe('buildModelEnv (BGPMODE826)', () => {
+  it('returns empty string when no ANTHROPIC_* vars are set', () => {
+    expect(buildModelEnv({})).toBe('')
+    expect(buildModelEnv({ PATH: '/usr/bin' })).toBe('')
+  })
+
+  it('exports each known ANTHROPIC_* var when set', () => {
+    const out = buildModelEnv({
+      ANTHROPIC_BASE_URL: 'https://api.example.com',
+      ANTHROPIC_AUTH_TOKEN: 'sk-test-token',
+      ANTHROPIC_MODEL: 'claude-test',
+    })
+    expect(out).toContain(`export ANTHROPIC_BASE_URL='https://api.example.com'`)
+    expect(out).toContain(`export ANTHROPIC_AUTH_TOKEN='sk-test-token'`)
+    expect(out).toContain(`export ANTHROPIC_MODEL='claude-test'`)
+  })
+
+  it('joins multiple exports with ` && ` so they chain in a single shell command', () => {
+    const out = buildModelEnv({
+      ANTHROPIC_BASE_URL: 'a',
+      ANTHROPIC_API_KEY: 'b',
+    })
+    expect(out).toBe(`export ANTHROPIC_BASE_URL='a' && export ANTHROPIC_API_KEY='b'`)
+  })
+
+  it('escapes single quotes in values so shell injection is impossible', () => {
+    // A '\'' trükk: zarjuk a ' körulezart sztringet, rakjunk egy esc-elt '-
+    // t, majd nyissunk egy uj sztringet. A replace MINDEN ' karaktert
+    // atalakit, igy a 'evil';rm -rf / mintabol 'evil'\'';rm -rf / lesz,
+    // es az egesz egy kulsz sztringen belulre kerul.
+    const out = buildModelEnv({ ANTHROPIC_BASE_URL: `https://x.com/'evil';rm -rf /` })
+    // A teljes export-sor egyetlen shell-tokenkent ertekelodik ki:
+    // a '...' kornyezo sztring vegen a kulsz ' zar, kozben '\'' escape-elt,
+    // utana uj ' nyit -- ezert shell oldalrol az egesz egyetlen sztring.
+    expect(out).toBe(`export ANTHROPIC_BASE_URL='https://x.com/'\\''evil'\\'';rm -rf /'`)
+    // Fontos: a `rm -rf /` az export-sor reszekent jelenik meg (parameter-
+    // kent), nem kulon shell-parancskent. A `\\''` zarojelparok biztositjak,
+    // hogy ne lehessen a ' kozul kilepve egy masik parancsot injectalni.
+    expect(out).toContain(`'\\'';rm -rf /'`)
+  })
+
+  it('ignores unknown env vars (only the whitelisted keys propagate)', () => {
+    const out = buildModelEnv({
+      ANTHROPIC_BASE_URL: 'kell',
+      PATH: '/usr/bin',
+      HOME: '/home/x',
+      RANDOM_NOISE: 'noise',
+      ANTHROPIC_AUTH_TOKEN: 'kell2',
+    })
+    expect(out).toContain(`export ANTHROPIC_BASE_URL='kell'`)
+    expect(out).toContain(`export ANTHROPIC_AUTH_TOKEN='kell2'`)
+    expect(out).not.toContain('PATH')
+    expect(out).not.toContain('HOME')
+    expect(out).not.toContain('RANDOM_NOISE')
+  })
+
+  it('handles every documented MODEL_ENV_KEYS key', () => {
+    const all = {
+      ANTHROPIC_BASE_URL: '1',
+      ANTHROPIC_AUTH_TOKEN: '2',
+      ANTHROPIC_API_KEY: '3',
+      ANTHROPIC_MODEL: '4',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: '5',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: '6',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: '7',
+    }
+    const out = buildModelEnv(all)
+    for (const k of Object.keys(all)) {
+      expect(out).toContain(`export ${k}='${all[k as keyof typeof all]}'`)
+    }
+  })
+})
+
+// BGPMODE826 INTEGRÁCIÓS TESZT (kézi): tmux szerver env-izoláció (production-only bug).
+// A tmux kliens-szerver architektúra miatt egy új session a SZERVER env-jét
+// örökli, nem a kliensét -- ezt unit-tesztben nem lehet 100%-osan rekonstruálni
+// (mert a tesztkörnyezetben a tmux szerver a teszt idején indul, és minden
+// session örökli az aktuális process.env-et). A TELJES regression ellenőrzéshez
+// kézzel kell futtatni:
+//
+//   1. Terminálban indíts egy host tmux szervert: `tmux`
+//   2. A dashboard-ból spawnolj egy háttérfeladatot (POST /api/background-tasks)
+//   3. A task kimenetében a "Not logged in - Please run /login" NEM szabad megjelenjen
+//   4. Ha megjelenik, a fix visszarepült: buildModelEnv kimenete nem került a parancsba
+//
+// A lentebbi unit teszt csak a koncepciót rögzíti: ha a parancs a buildModelEnv
+// kimenetével kezdődik, a session-ben az ANTHROPIC_* változók LÁTSZANAK,
+// függetlenül a tmux szerver induláskori env-jétől.
+describe('tmux server env isolation -- manual regression recipe (BGPMODE826)', () => {
+  it('buildModelEnv output, ha a parancs első tokenje, garantáltan propagálódik', () => {
+    const exported = buildModelEnv({ ANTHROPIC_BASE_URL: 'https://probe.example' })
+    expect(exported.startsWith(`export ANTHROPIC_BASE_URL=`)).toBe(true)
+    expect(exported).toBe(`export ANTHROPIC_BASE_URL='https://probe.example'`)
   })
 })
