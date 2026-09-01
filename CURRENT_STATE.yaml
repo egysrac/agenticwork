@@ -4,10 +4,10 @@
 # Keep concise (max ~ 50 sor). Update after every TASK DONE / BLOCKED.
 # Séma: TASK_SCHEMA.yaml `context_required` + `next_action` mezők.
 
-active_task: TASK-0007
-status: running
+active_task: null
+status: phase_1_complete
 
-# === DONE TASK-OK (az aktuális session / Phase során) ===
+# === DONE TASK-OK (Phase 1) ===
 completed:
   - TASK-0001: inspect Marveen architecture (top-level + store + src + skills + kanban)
   - TASK-0002: identify conflicts + preserve working capabilities
@@ -15,8 +15,11 @@ completed:
   - TASK-0004: skills/marveen-agentic-dev/WORKFLOW.md
   - TASK-0005: skills/marveen-agentic-dev/TOKEN/FAILURE/QUALITY/ROUTING policies
   - TASK-0006: PROJECT_MEMORY.md (tartós projekt tudás)
+  - TASK-0007: CURRENT_STATE.yaml (resume-from-context)
+  - TASK-0008: decisions/ADR-0001.md (Phase 1 implementation decision)
+  - TASK-0009: validate Phase 1 + git checkpoint (commit 209aa30) + state update
 
-# === MÓDOSÍTOTT / LÉTREHOZOTT FÁJLOK ===
+# === LÉTREHOZOTT FÁJLOK ===
 files_modified:
   - skills/marveen-agentic-dev/SKILL.md
   - skills/marveen-agentic-dev/TASK_SCHEMA.yaml
@@ -26,49 +29,58 @@ files_modified:
   - skills/marveen-agentic-dev/QUALITY_POLICY.md
   - skills/marveen-agentic-dev/ROUTING_POLICY.md
   - PROJECT_MEMORY.md
+  - CURRENT_STATE.yaml
+  - decisions/ADR-0001.md
 
 # === VERIFIKÁCIÓ ===
 verification:
-  passed: 6
+  passed: 9
   failed: 0
+  git_commit: 209aa30
+  files_in_commit: 10
+  lines_added_in_commit: 1580
+  unrelated_files_preserved: 10 (5 modified + 5 untracked, NOT in commit)
 
 # === AKTUÁLIS HIBA (null ha nincs) ===
 current_failure: null
 
 # === KÖVETKEZŐ LÉPÉS (one-line, resumable) ===
-next_action: TASK-0008: create decisions/ + ADR-0001.md (Phase 1 implementation decision)
+next_action: AWAITING_APPROVAL: Phase 2 (Local AI Gateway) -- Sonnet/Opus split + Context Gate integráció (approval gate a .env + src/ módosításokhoz, lásd ADR-0001 follow-ups)
 
 # === MINIMUM REQUIRED CONTEXT (resume-hoz) ===
 context_required:
   - skills/marveen-agentic-dev/SKILL.md
   - skills/marveen-agentic-dev/TASK_SCHEMA.yaml
   - PROJECT_MEMORY.md
+  - decisions/ADR-0001.md
   - store/.dashboard-token (memory + daily-log API)
 
 # === VÉGREHAJTÁSI KONTEXTUS ===
 execution_context:
   branch: develop
-  phase: 1-standard-work
-  current_EPIC: EPIC-MARVEEN-AGENTIC-OS (Phase 1: Standard Work)
-  next_TASKS:
-    - TASK-0008: decisions/ + ADR-0001.md (Phase 1 implementation decision)
-    - TASK-0009: validate Phase 1 + checkpoint (Git commit + state update)
+  phase: 1-complete
+  current_EPIC: EPIC-MARVEEN-AGENTIC-OS (Phase 1: COMPLETE -- awaiting Phase 2 approval)
+  next_TASKS: []    # Phase 2-5 az approval gate-en át indulnak
+  checkpoint_commit: 209aa30
 
 # === NYITOTT SZÁLAK (Phase 1-en kívül) ===
 open_threads:
-  - Holnap 10:00-kor HAOS reboot (GRUB timeout=300 aktiválódik) -- Telegram üzenet az eredményről
-  - Phase 2 (Local AI Gateway): Ollama + local Qwen integráció a `src/qwen-router.ts`-on át (már létezik, de a Context Gate Phase 3-ban jön)
+  - HAOS reboot scheduled 2026-09-02 10:00 (GRUB timeout=300) -- Telegram üzenet az eredményről (a ha_ws.py módosítás is ehhez kapcsolódhat)
+  - Phase 2 (Local AI Gateway): Sonnet/Opus split a .env-ben + Context Gate integráció a src/qwen-router.ts-on át -- APPROVAL GATE SZÜKSÉGES
   - Phase 3 (Context Gate): deterministic search + vector retrieval + Qwen relevance filter + min context assembly
-  - Phase 4 (Dynamic Model Escalation): Sonnet/Opus split (jelenleg minden szint Opus a .env-ben)
+  - Phase 4 (Dynamic Model Escalation): az L2/L3 split befejezése, cost monitoring
+  - Phase 5 (Quality + PDCA): mért metrikák alapján a TASK-XXXX prefix konvenció finomítása
 
-# === METRIKÁK (Phase 1) ===
+# === METRIKÁK (Phase 1 -- ZÁRÓ) ===
 metrics:
-  tasks_done: 6
-  tasks_remaining_in_phase_1: 2
-  files_created: 8
-  lines_added_total_approx: 1200
-  llm_calls: 4       # TASK-0001 inspect, TASK-0002 conflicts, TASK-0003 SKILL+SCHEMA, TASK-0004 WORKFLOW
-  cloud_calls: 4     # all from the main Opus session
-  local_qwen_calls: 0
-  repair_attempts: 0
-  first_pass_success: true
+  tasks_done: 9
+  tasks_remaining_in_phase_1: 0
+  files_created: 10
+  lines_added_total: 1580
+  llm_calls_phase_1: 4       # TASK-0001 inspect, TASK-0002 conflicts, TASK-0003 SKILL+SCHEMA, TASK-0004 WORKFLOW
+  cloud_calls_phase_1: 4     # all from the main Opus session
+  local_qwen_calls_phase_1: 0
+  repair_attempts_phase_1: 0
+  first_pass_success_phase_1: true
+  fpy: 1.0                   # 9/9 first-pass success
+  cost_estimate_phase_1: low # csak inspect + 4 policy fájl cloud hívás, a többi file-rendszer + bash
