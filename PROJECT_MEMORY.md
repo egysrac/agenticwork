@@ -32,7 +32,7 @@ A `skills/marveen-agentic-dev/SKILL.md` a TASK-kezelés szabályait írja le, ez
 
 - **WIP = 1** -- egy aktív TASK/dev folyamat; background-job MiniMax-M3-on futhat párhuzamosan
 - **Retry**: max 2 autonóm repair, utána BLOCKED + structured failure report
-- **Cloud model**: MiniMax proxy-n át (`ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic`); jelenleg minden szint `claude-opus-4-6` (Phase 2 split: Sonnet default + Opus escalation kell)
+- **Cloud model**: MiniMax proxy-n át (`ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic`); `ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6` (Sonnet default, TASK-0010 bevezetve 2026-09-01), `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6` (Opus escalation), `MAIN_AGENT_MODEL=claude-opus-4-6` (főágens), `DEFAULT_AGENT_MODEL=claude-opus-4-6` (háttér-jobok -- TASK-0011-ben megy Sonnet-re a Context Gate integrációval)
 - **Local Qwen**: HA NUC Ollama (`qwen2.5:3b`), `OLLAMA_URL=http://192.168.1.53:11434` a `.env`-ben
 - **RESPAWN_ENABLED=0** -- respawn ki, a channel-plugin monitor nem indul el
 - **Háttér-jobok (jarvis-worker)**: MiniMax-M3 modellel, olcsó + korlátlan

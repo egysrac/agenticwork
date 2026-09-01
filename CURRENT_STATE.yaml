@@ -4,10 +4,10 @@
 # Keep concise (max ~ 50 sor). Update after every TASK DONE / BLOCKED.
 # Séma: TASK_SCHEMA.yaml `context_required` + `next_action` mezők.
 
-active_task: null
-status: phase_1_complete
+active_task: TASK-0011
+status: running
 
-# === DONE TASK-OK (Phase 1) ===
+# === DONE TASK-OK (Phase 1 + Phase 2 elsők) ===
 completed:
   - TASK-0001: inspect Marveen architecture (top-level + store + src + skills + kanban)
   - TASK-0002: identify conflicts + preserve working capabilities
@@ -17,9 +17,10 @@ completed:
   - TASK-0006: PROJECT_MEMORY.md (tartós projekt tudás)
   - TASK-0007: CURRENT_STATE.yaml (resume-from-context)
   - TASK-0008: decisions/ADR-0001.md (Phase 1 implementation decision)
-  - TASK-0009: validate Phase 1 + git checkpoint (commit 209aa30) + state update
+  - TASK-0009: validate Phase 1 + git checkpoint (commit 209aa30) + state update (commit d32b0f6)
+  - TASK-0010: .env Sonnet/Opus split -- ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (service restart TASK-0013-ban)
 
-# === LÉTREHOZOTT FÁJLOK ===
+# === MÓDOSÍTOTT FÁJLOK ===
 files_modified:
   - skills/marveen-agentic-dev/SKILL.md
   - skills/marveen-agentic-dev/TASK_SCHEMA.yaml
@@ -31,56 +32,100 @@ files_modified:
   - PROJECT_MEMORY.md
   - CURRENT_STATE.yaml
   - decisions/ADR-0001.md
+  - .env                                                       # TASK-0010 (DONE, not in git -- .gitignore)
+  - src/config.ts                                              # TASK-0011 (TBD)
+  - src/qwen-router.ts                                         # TASK-0011 (TBD)
 
 # === VERIFIKÁCIÓ ===
 verification:
-  passed: 9
+  passed: 10
   failed: 0
-  git_commit: 209aa30
-  files_in_commit: 10
-  lines_added_in_commit: 1580
+  git_commit_phase_1: 209aa30
+  git_commit_state_update: d32b0f6
+  task_0010_manual_verify:
+    env_line_set: ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (grep-verified)
+    model_env_keys_contains_sonnet: src/web/routes/background-tasks.ts:34 (grep-verified)
+    build_model_env_reads_process_env: true (kódból látható)
+    typecheck_passed: true (npm run typecheck, 2026-09-01T23:19Z)
+    project_memory_documented: true (Cloud model sor frissítve)
+    unit_test_blocked: live-install guard -- worktree + TASK-0013 integrációs teszt
   unrelated_files_preserved: 10 (5 modified + 5 untracked, NOT in commit)
 
 # === AKTUÁLIS HIBA (null ha nincs) ===
 current_failure: null
 
 # === KÖVETKEZŐ LÉPÉS (one-line, resumable) ===
-next_action: AWAITING_APPROVAL: Phase 2 (Local AI Gateway) -- Sonnet/Opus split + Context Gate integráció (approval gate a .env + src/ módosításokhoz, lásd ADR-0001 follow-ups)
+next_action: TASK-0011 in progress -- src/config.ts + src/qwen-router.ts Context Gate integráció (relevance filter a Qwen-en)
 
 # === MINIMUM REQUIRED CONTEXT (resume-hoz) ===
 context_required:
   - skills/marveen-agentic-dev/SKILL.md
   - skills/marveen-agentic-dev/TASK_SCHEMA.yaml
+  - skills/marveen-agentic-dev/ROUTING_POLICY.md
   - PROJECT_MEMORY.md
   - decisions/ADR-0001.md
   - store/.dashboard-token (memory + daily-log API)
+  - src/qwen-router.ts (a Context Gate integráció alapja)
+  - src/config.ts (a DEFAULT_AGENT_MODEL Sonnet-re állítása)
 
 # === VÉGREHAJTÁSI KONTEXTUS ===
 execution_context:
   branch: develop
-  phase: 1-complete
-  current_EPIC: EPIC-MARVEEN-AGENTIC-OS (Phase 1: COMPLETE -- awaiting Phase 2 approval)
-  next_TASKS: []    # Phase 2-5 az approval gate-en át indulnak
-  checkpoint_commit: 209aa30
+  phase: 2-local-ai-gateway
+  current_EPIC: EPIC-MARVEEN-AGENTIC-OS (Phase 2: Local AI Gateway)
+  next_TASKS:
+    - TASK-0011: src/config.ts + src/qwen-router.ts Context Gate integráció (relevance filter)
+    - TASK-0012: Min context assembly + token budget enforcement
+    - TASK-0013: Phase 2 verification (worktree + integration test against HA NUC + service restart)
+    - TASK-0014: Phase 2 checkpoint + ADR-0002
+  checkpoints:
+    - 209aa30 (Phase 1 skill package + state)
+    - d32b0f6 (Phase 1 state update)
+  approval_received: 2026-09-01T22:11Z (Alex: "Kezdheted")
 
-# === NYITOTT SZÁLAK (Phase 1-en kívül) ===
+# === PRIORITÁS-VÉDELEM (ABSZOLÚT) ===
+priority_protection:
+  sacred_schedules:
+    - name: dream-engine
+      cron: "7 2 * * *"
+      type: dream-engine
+      enabled: true
+    - name: reggeli-napindito
+      cron: "7 2 * * *"
+      type: dream-engine (fájlba ír)
+      enabled: true
+    - name: reggeli-napindito-send
+      cron: "0 6 * * *"
+      type: command (scripted send)
+      enabled: true
+      failThreshold: 10
+    - name: reggeli-monitor-0605
+      cron: "*/10 6-8 * * *"
+      type: task (ön-javító monitor)
+      enabled: true
+  service_restart_window: 22:00-02:00 vagy 08:50-22:00 (a 02:07-06:00 időablak TILTOTT)
+  last_verified: 2026-09-01T23:19Z
+
+# === NYITOTT SZÁLAK ===
 open_threads:
-  - HAOS reboot scheduled 2026-09-02 10:00 (GRUB timeout=300) -- Telegram üzenet az eredményről (a ha_ws.py módosítás is ehhez kapcsolódhat)
-  - Phase 2 (Local AI Gateway): Sonnet/Opus split a .env-ben + Context Gate integráció a src/qwen-router.ts-on át -- APPROVAL GATE SZÜKSÉGES
-  - Phase 3 (Context Gate): deterministic search + vector retrieval + Qwen relevance filter + min context assembly
+  - HAOS reboot scheduled 2026-09-02 10:00 (GRUB timeout=300) -- Telegram üzenet az eredményről
+  - Phase 3 (Context Gate teljes pipeline): deterministic search + vector retrieval + Qwen relevance filter + min context assembly
   - Phase 4 (Dynamic Model Escalation): az L2/L3 split befejezése, cost monitoring
   - Phase 5 (Quality + PDCA): mért metrikák alapján a TASK-XXXX prefix konvenció finomítása
 
-# === METRIKÁK (Phase 1 -- ZÁRÓ) ===
+# === METRIKÁK (Phase 1 záró + Phase 2 halad) ===
 metrics:
-  tasks_done: 9
-  tasks_remaining_in_phase_1: 0
+  tasks_done: 10
+  tasks_remaining_in_phase_2: 4
   files_created: 10
   lines_added_total: 1580
-  llm_calls_phase_1: 4       # TASK-0001 inspect, TASK-0002 conflicts, TASK-0003 SKILL+SCHEMA, TASK-0004 WORKFLOW
-  cloud_calls_phase_1: 4     # all from the main Opus session
+  llm_calls_phase_1: 4
+  cloud_calls_phase_1: 4
   local_qwen_calls_phase_1: 0
   repair_attempts_phase_1: 0
   first_pass_success_phase_1: true
-  fpy: 1.0                   # 9/9 first-pass success
-  cost_estimate_phase_1: low # csak inspect + 4 policy fájl cloud hívás, a többi file-rendszer + bash
+  fpy: 1.0
+  phase_2_progress: 1/5
+  cloud_calls_task_0010: 0  # csak manual verify + file edit
+  local_qwen_calls_task_0010: 0
+  service_restart_pending: true (TASK-0013-ban, a 02:07-06:00 időablakon kívül)
