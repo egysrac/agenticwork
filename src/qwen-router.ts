@@ -168,3 +168,166 @@ export async function classify(
   const idx = parseInt(m[1], 10) - 1
   return labels[idx] ?? labels[0]
 }
+
+// =============================================================================
+// Context Gate relevance filter (Phase 2 / TASK-0011)
+//
+// The Context Gate pipeline (PROJECT_MEMORY.md "Routing") feeds every cloud
+// call through a local-relevance step BEFORE the prompt leaves the box: the
+// deterministic search + vector retrieval return N candidate chunks, and the
+// 3B Qwen on the LAN filters them down to the top-K that actually answer the
+// query. The cloud model then sees a small, dense context instead of a noisy
+// dump -- the cost win is the difference between "send 50 KB of context" and
+// "send 2 KB of pre-filtered context".
+//
+// Design notes:
+//   - Batch-first (one round-trip). A 3B model is small enough that structured
+//     JSON output is flaky, so the batch path is wrapped in a JSON parse: if
+//     the model freeforms a preamble or wraps the array in markdown fences,
+//     we fall back to per-chunk classify().
+//   - The fallback path costs N round-trips (one classify per chunk), so it is
+//     genuinely a slow path. Callers that pre-filter to <=20 chunks are fine;
+//     callers passing 100+ chunks should pre-trim themselves first.
+//   - The router's existing provider fallback (Qwen -> Anthropic) still
+//     applies: if the LAN Ollama is down, this whole function transparently
+//     escalates to the registered Anthropic caller for the relevance call.
+// =============================================================================
+
+/** A unit of context passed to the relevance filter. */
+export interface RelevanceChunk {
+  /** Stable id (e.g. file:line, memory id, retriever key). Echoed in the result. */
+  id: string
+  /** The text the model should score. */
+  content: string
+}
+
+/** One scored chunk returned by the relevance filter. */
+export interface RelevanceResult {
+  /** The id of the source chunk. */
+  id: string
+  /** Relevance score in [0.0, 1.0]; higher = more relevant. */
+  score: number
+}
+
+/** Options for `relevanceFilter`. Extends `CompleteOptions` with `topK`. */
+export interface RelevanceFilterOptions extends CompleteOptions {
+  /** Maximum number of chunks to return. Defaults to 5. */
+  topK?: number
+}
+
+const DEFAULT_RELEVANCE_TOP_K = 5
+const RELEVANCE_BATCH_MAX_TOKENS = 400
+const RELEVANCE_BATCH_PROMPT_CHUNK_CHARS = 500
+const RELEVANCE_BATCH_PROMPT_QUERY_CHARS = 500
+const RELEVANCE_FALLBACK_CONTENT_CHARS = 200
+
+/**
+ * Ranks `chunks` by relevance to `query` and returns the top-K.
+ *
+ * Behaviour:
+ *   1. Empty input -> empty result (no model call).
+ *   2. Batch path: a single prompt asks the model to return the top-K as JSON.
+ *      If the response does not parse as a JSON array of {id, score}, OR
+ *      fewer than topK valid items come back, the function logs and falls back
+ *      to the per-chunk path so the caller still gets SOMETHING sorted.
+ *   3. Per-chunk fallback: one `classify()` call per chunk with the labels
+ *      ['releváns', 'nem releváns']; relevant = 0.5, not relevant = 0.0.
+ *      Returned sorted descending, sliced to topK.
+ *
+ * NEVER throws; on total failure (both paths error) returns an empty array
+ * so the Context Gate can degrade to "no pre-filter" rather than abort the
+ * surrounding cloud call.
+ */
+export async function relevanceFilter(
+  query: string,
+  chunks: readonly RelevanceChunk[],
+  opts: RelevanceFilterOptions = {},
+): Promise<RelevanceResult[]> {
+  const topK = opts.topK ?? DEFAULT_RELEVANCE_TOP_K
+  if (chunks.length === 0) return []
+
+  // ---- Batch path (1 round-trip) ----
+  const batchPrompt = buildRelevanceBatchPrompt(query, chunks, topK)
+  try {
+    const batchResult = await complete(batchPrompt, {
+      ...opts,
+      maxTokens: RELEVANCE_BATCH_MAX_TOKENS,
+      temperature: 0,
+    })
+    const parsed = parseRelevanceBatchResponse(batchResult.text, chunks, topK)
+    if (parsed.length >= Math.min(topK, chunks.length)) {
+      return parsed.slice(0, topK)
+    }
+    logger.warn(
+      { batchLength: parsed.length, wanted: Math.min(topK, chunks.length) },
+      'qwen-router: relevance batch returned fewer items than asked, falling back to per-chunk',
+    )
+  } catch (err) {
+    logger.warn(
+      { err, chunkCount: chunks.length },
+      'qwen-router: relevance batch path failed, falling back to per-chunk',
+    )
+  }
+
+  // ---- Per-chunk fallback (N round-trips) ----
+  const scored: RelevanceResult[] = []
+  for (const chunk of chunks) {
+    let score = 0.0
+    try {
+      const label = await classify(
+        `Query: ${query.slice(0, RELEVANCE_FALLBACK_CONTENT_CHARS)}\n\nChunk ${chunk.id}: ${chunk.content.slice(0, RELEVANCE_FALLBACK_CONTENT_CHARS)}`,
+        ['releváns', 'nem releváns'],
+        { ...opts, cost: 'low' },
+      )
+      score = label === 'releváns' ? 0.5 : 0.0
+    } catch (err) {
+      logger.warn({ err, chunkId: chunk.id }, 'qwen-router: per-chunk classify failed, score=0')
+      score = 0.0
+    }
+    scored.push({ id: chunk.id, score })
+  }
+  return scored.sort((a, b) => b.score - a.score).slice(0, topK)
+}
+
+function buildRelevanceBatchPrompt(query: string, chunks: readonly RelevanceChunk[], topK: number): string {
+  const chunkList = chunks
+    .map((c, i) => `${i + 1}. [${c.id}] ${c.content.slice(0, RELEVANCE_BATCH_PROMPT_CHUNK_CHARS)}`)
+    .join('\n')
+  return (
+    `Rangsorold az alábbi szövegrészleteket a query-val való relevancia szerint (0.0-1.0 skálán, 1.0 = tökéletesen releváns). ` +
+    `Adj vissza egy JSON tömböt a top-${topK} legrelevánsabb chunk-ról, csökkenő sorrendben: ` +
+    `[{"id": "<chunk_id>", "score": <0.0-1.0>}, ...]. Csak a JSON-t add vissza, semmi mást.\n\n` +
+    `Query: ${query.slice(0, RELEVANCE_BATCH_PROMPT_QUERY_CHARS)}\n\n` +
+    `Chunks:\n${chunkList}\n\n` +
+    `Válasz (csak JSON):`
+  )
+}
+
+function parseRelevanceBatchResponse(
+  text: string,
+  chunks: readonly RelevanceChunk[],
+  topK: number,
+): RelevanceResult[] {
+  const arrayMatch = text.match(/\[[\s\S]*\]/)
+  if (!arrayMatch) return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(arrayMatch[0])
+  } catch {
+    return []
+  }
+  if (!Array.isArray(parsed)) return []
+  const knownIds = new Set(chunks.map((c) => c.id))
+  const results: RelevanceResult[] = []
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') continue
+    const id = (item as { id?: unknown }).id
+    const score = (item as { score?: unknown }).score
+    if (typeof id !== 'string' || !knownIds.has(id)) continue
+    if (typeof score !== 'number' || Number.isNaN(score)) continue
+    const clamped = Math.max(0, Math.min(1, score))
+    results.push({ id, score: clamped })
+    if (results.length >= topK) break
+  }
+  return results
+}
