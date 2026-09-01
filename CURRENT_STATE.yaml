@@ -5,9 +5,9 @@
 # Séma: TASK_SCHEMA.yaml `context_required` + `next_action` mezők.
 
 active_task: TASK-0013
-status: running
+status: blocked_awaiting_alex
 
-# === DONE TASK-OK (Phase 1 + Phase 2) ===
+# === DONE TASK-OK (Phase 1 + Phase 2 első fele) ===
 completed:
   - TASK-0001: inspect Marveen architecture (top-level + store + src + skills + kanban)
   - TASK-0002: identify conflicts + preserve working capabilities
@@ -47,19 +47,24 @@ verification:
     - d32b0f6 (Phase 1 state update)
     - 0766b3a (TASK-0010: ANTHROPIC_DEFAULT_SONNET_MODEL Sonnet)
     - a5136c8 (TASK-0011: relevanceFilter() in src/qwen-router.ts)
+    - 393efe2 (TASK-0012: DEFAULT_AGENT_MODEL Sonnet + ADR-0002 draft)
   task_0010_manual_verify:
     env_line_set: ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (grep-verified)
     model_env_keys_contains_sonnet: src/web/routes/background-tasks.ts:34 (grep-verified)
     typecheck_passed: true
   task_0011_manual_verify:
-    relevance_filter_added: true (RelevanceChunk, RelevanceResult, RelevanceFilterOptions, relevanceFilter())
-    typecheck_passed: true (npm run typecheck, 2026-09-01T23:25Z)
-    complete_classify_unchanged: true (csak hozzáadás, nem módosítás)
-    batch_fallback_logic: true (batch JSON parse + per-chunk classify fallback)
+    relevance_filter_added: true
+    typecheck_passed: true (2026-09-01T23:25Z)
+    batch_fallback_logic: true
   task_0012_manual_verify:
     env_line_set: DEFAULT_AGENT_MODEL=claude-sonnet-4-6 (grep-verified)
-    project_memory_updated: true (Cloud model sor)
-    adr_0002_drafted: true (decisions/ADR-0002.md)
+    project_memory_updated: true
+    adr_0002_drafted: true
+  task_0013_preflight:
+    ha_nuc_ollama_ok: true (qwen2.5:3b elérhető, 192.168.1.53:11434, 3 model)
+    minimax_proxy_sonnet_ok: true (HTTP 200, model="MiniMax-M3", 165 token)
+    cloud_test_cost: 165 tokens (~164 input + 1 output)
+    service_restart_decision: ALEX ÁLTAL -- mikor restartoljunk (most 23:30-02:00 vagy 08:50+)
   unit_tests_pending: TASK-0013 worktree + integration test
   service_restart_pending: true (TASK-0013-ban, 22:00-02:00 vagy 08:50-22:00)
 
@@ -67,7 +72,7 @@ verification:
 current_failure: null
 
 # === KÖVETKEZŐ LÉPÉS (one-line, resumable) ===
-next_action: TASK-0013 in progress -- worktree + HA NUC integration test + MiniMax proxy Sonnet elérhetőség + service restart (22:00-02:00 ablakban)
+next_action: ALEX ÁLTAL: service restart időzítésének jóváhagyása (most 23:30-02:00, vagy 08:50 után). A Sonnet elérhetőség-teszt sikeres (MiniMax-M3 a proxy-n), de a "Sonnet" elnevezés félrevezető -- a tényleges modell MiniMax-M3.
 
 # === MINIMUM REQUIRED CONTEXT (resume-hoz) ===
 context_required:
@@ -80,6 +85,7 @@ context_required:
   - store/.dashboard-token (memory + daily-log API)
   - src/qwen-router.ts (relevanceFilter)
   - .env (Sonnet split, .gitignore-ban)
+  - project_minimax_proxy_actual_model.md (memória)
 
 # === VÉGREHAJTÁSI KONTEXTUS ===
 execution_context:
@@ -92,9 +98,11 @@ execution_context:
   checkpoints:
     - 209aa30 (Phase 1 skill package + state)
     - d32b0f6 (Phase 1 state update)
-    - 0766b3a (TASK-0010: ANTHROPIC_DEFAULT_SONNET_MODEL)
-    - a5136c8 (TASK-0011: relevanceFilter)
+    - 0766b3a (TASK-0010)
+    - a5136c8 (TASK-0011)
+    - 393efe2 (TASK-0012)
   approval_received: 2026-09-01T22:11Z (Alex: "Kezdheted")
+  service_restart_decision_pending: 2026-09-01T23:32Z (Alex-szel egyeztetés alatt)
 
 # === PRIORITÁS-VÉDELEM (ABSZOLÚT) ===
 priority_protection:
@@ -103,7 +111,7 @@ priority_protection:
       cron: "7 2 * * *"
       type: dream-engine
       enabled: true
-      next_run: 2026-09-02T00:07Z (kb. 38 perc múlva)
+      next_run: 2026-09-02T00:07Z (kb. 35 perc múlva)
     - name: reggeli-napindito
       cron: "7 2 * * *"
       type: dream-engine (fájlba ír)
@@ -118,8 +126,10 @@ priority_protection:
       type: task (ön-javító monitor)
       enabled: true
   service_restart_window: 22:00-02:00 (most) vagy 08:50-22:00
-  service_restart_deadline: 2026-09-02T00:07Z ELŐTT (a dream-engine előtt) VAGY 2026-09-02T06:50Z UTÁN
-  last_verified: 2026-09-01T23:30Z
+  service_restart_deadline_options:
+    - 2026-09-02T00:07Z ELŐTT (kb. 35 perc) -- a dream-engine előtt
+    - 2026-09-02T06:50Z UTÁN -- a napi riport + monitor után
+  last_verified: 2026-09-01T23:32Z
 
 # === NYITOTT SZÁLAK ===
 open_threads:
@@ -141,7 +151,8 @@ metrics:
   first_pass_success_phase_1: true
   fpy: 1.0
   phase_2_progress: 3/5            # TASK-0010..0012 done
-  cloud_calls_phase_2: 0           # csak file edit + manual verify
-  local_qwen_calls_phase_2: 0       # worktree integrációs teszt TASK-0013-ban
+  cloud_calls_phase_2: 1           # Sonnet elérhetőség-teszt (165 token)
+  cloud_tokens_phase_2: 165
+  local_qwen_calls_phase_2: 0
   service_restart_pending: true    # TASK-0013-ban
-  next_restart_window_opens: 2026-09-02T00:07Z ELŐTT (kb. 38 perc) VAGY 2026-09-02T06:50Z UTÁN
+  minimax_proxy_actual_model: MiniMax-M3 (NEM valódi Claude Sonnet)
