@@ -1,0 +1,162 @@
+# TASK-XXXX.yaml schema for Marveen Agentic OS
+# Minden TASK rekord ezt a sémát követi a tasks/ mappában.
+# A Definition of Ready (DoR) és Definition of Done (DoD) alapján.
+# State machine: NEW → READY → RUNNING → VERIFY → DONE | REPAIR (max 2) → BLOCKED
+
+# === KÖTELEZŐ MEZŐK (Definition of Ready alapján) ===
+
+required:
+  # Azonosítás
+  id: string                     # TASK-XXXX (4-jegyű zero-padded, pl. TASK-0001)
+  title: string                  # outcome-focused, max 80 char, kanban title-be prefixelve
+  type: enum                     # [epic, feature, task, action]
+
+  # Prioritás és állapot
+  priority: enum                 # [low, normal, high, urgent]
+  status: enum                   # [new, ready, running, verify, repair, blocked, done]
+
+  # Cél és elfogadási kritériumok
+  goal: string                   # one-line objective
+  acceptance_criteria:           # mérhető, specifikus lista
+    - string
+
+  # Függőségek és rizikó
+  dependencies:                  # TASK-XXXX lista, amikre szükség van
+    - string
+  risk: enum                     # [low, medium, high]
+  complexity: enum               # [trivial, small, medium, complex]
+
+  # Reprodukálhatóság
+  attempts: integer              # repair attempts count (max 2 a Retry Policy szerint)
+  created_at: string             # ISO 8601 UTC
+  updated_at: string             # ISO 8601 UTC
+  result: string | null          # free text DONE/BLOCKED után
+
+
+# === VÉGREHAJTÁSI MEZŐK (Definition of Done alapján) ===
+
+execution:
+  files_modified:                # módosított fájlok relatív útvonala
+    - string
+  verification:                  # verifikáció eredménye
+    passed: integer              # tesztek, amik átmentek
+    failed: integer              # tesztek, amik elbuktak
+  current_failure:               # null ha nincs, különben az aktuális hiba
+    test: string
+    error: string
+    stack: string | null
+
+
+# === RESUME-FROM-CONTEXT (CURRENT_STATE.yaml-ból is linkelve) ===
+
+next_action: string              # one-line, resumable a következő agent context számára
+context_required:                # minimum required context sources
+  - string                       # TASK-XXXX.yaml (saját rekord)
+  - string                       # src/... (releváns fájl)
+  - string                       # docs/... (releváns doc)
+  - string                       # ADR-XXXX.md (architektúra döntés)
+
+
+# === METRICS (a rendszer tölti, kézzel nem szerkesztendő) ===
+
+metrics:
+  llm_calls: integer             # összes LLM hívás
+  local_model_calls: integer     # qwen2.5:3b (HA NUC) hívások
+  cloud_model_calls: integer     # MiniMax / claude hívások
+  strong_model_calls: integer    # claude-opus-4-6 / LEVEL 3 hívások
+  repair_attempts: integer       # REPAIR ciklusok száma (max 2)
+  files_read: integer            # Read tool hívások
+  files_modified: integer        # Write/Edit tool hívások
+  tests_passed: integer          # sikeres tesztek
+  tests_failed: integer          # elbukott tesztek
+  first_pass_success: boolean    # true ha első VERIFY átment REPAIR nélkül
+  lead_time_seconds: integer     # NEW → DONE idő
+
+
+# === SZABAD MEZŐ ===
+
+notes: string                    # free-form megjegyzés, alapból nem keresett
+
+
+# === ÁLLAPOTGÉP ÁTMENETEK ===
+
+state_transitions:
+  new:           [ready, blocked]                # DoR checklist elbírálása
+  ready:         [running, blocked]              # dependencies + context OK
+  running:       [verify, repair, blocked]       # implementáció kész / hiba
+  verify:        [done, repair, blocked]         # acceptance + tests
+  repair:        [verify, blocked]               # max 2 repair kísérlet
+  blocked:       [ready]                         # human approval / fix után
+
+
+# === DEFINITION OF READY (DoR) CHECKLIST ===
+
+definition_of_ready:
+  goal_defined: boolean
+  acceptance_criteria_defined: boolean
+  scope_understood: boolean
+  dependencies_known: boolean
+  required_context_available: boolean
+  risk_classified: boolean
+
+
+# === DEFINITION OF DONE (DoD) CHECKLIST ===
+
+definition_of_done:
+  implementation_completed: boolean
+  acceptance_criteria_satisfied: boolean
+  tests_executed: boolean
+  failed_tests_investigated: boolean
+  diff_inspected: boolean
+  unrelated_modifications_checked: boolean
+  persistent_task_state_updated: boolean
+  architecture_decisions_updated: boolean
+  continuation_state_updated: boolean
+  checkpoint_created: boolean
+
+
+# === PÉLDA (MINTA) ===
+
+example:
+  id: TASK-0001
+  title: "Inspect current Marveen architecture"
+  type: task
+  priority: normal
+  status: done
+  goal: "Átfogó inspect a jelenlegi Marveen struktúráról (top-level, store, src, skills, git, kanban)"
+  acceptance_criteria:
+    - "Top-level könyvtár lista megvan"
+    - "Store + src + skills + kanban inspect kész"
+    - "Git státusz + recent log dokumentálva"
+    - "Létező PROJECT_MEMORY/CURRENT_STATE/ADR/decisions jelenlét ellenőrizve"
+  dependencies: []
+  risk: low
+  complexity: trivial
+  attempts: 0
+  created_at: "2026-09-01T21:58:00:00Z"
+  updated_at: "2026-09-01T22:05:00:00Z"
+  result: "144 kanban kártya, 42 globális skill, 511 TS/JS src/, 9 MB SQLite store/"
+  execution:
+    files_modified: []
+    verification:
+      passed: 1
+      failed: 0
+    current_failure: null
+  next_action: "TASK-0002: identify conflicts + preserve working capabilities"
+  context_required:
+    - "/home/alex/marveen/"
+    - "store/.dashboard-token"
+    - "kanban API"
+  metrics:
+    llm_calls: 1
+    local_model_calls: 0
+    cloud_model_calls: 0
+    strong_model_calls: 0
+    repair_attempts: 0
+    files_read: 0
+    files_modified: 0
+    tests_passed: 0
+    tests_failed: 0
+    first_pass_success: true
+    lead_time_seconds: 420
+  notes: "Inspect kész. A meglévő rendszer kiterjesztendő, nem felülírandó."

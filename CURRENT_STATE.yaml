@@ -1,0 +1,74 @@
+# CURRENT_STATE.yaml
+# Resume-from-context for Marveen Agentic OS.
+# A new agent context can continue work from this file WITHOUT full conversation history.
+# Keep concise (max ~ 50 sor). Update after every TASK DONE / BLOCKED.
+# Séma: TASK_SCHEMA.yaml `context_required` + `next_action` mezők.
+
+active_task: TASK-0007
+status: running
+
+# === DONE TASK-OK (az aktuális session / Phase során) ===
+completed:
+  - TASK-0001: inspect Marveen architecture (top-level + store + src + skills + kanban)
+  - TASK-0002: identify conflicts + preserve working capabilities
+  - TASK-0003: skills/marveen-agentic-dev/SKILL.md + TASK_SCHEMA.yaml
+  - TASK-0004: skills/marveen-agentic-dev/WORKFLOW.md
+  - TASK-0005: skills/marveen-agentic-dev/TOKEN/FAILURE/QUALITY/ROUTING policies
+  - TASK-0006: PROJECT_MEMORY.md (tartós projekt tudás)
+
+# === MÓDOSÍTOTT / LÉTREHOZOTT FÁJLOK ===
+files_modified:
+  - skills/marveen-agentic-dev/SKILL.md
+  - skills/marveen-agentic-dev/TASK_SCHEMA.yaml
+  - skills/marveen-agentic-dev/WORKFLOW.md
+  - skills/marveen-agentic-dev/TOKEN_POLICY.md
+  - skills/marveen-agentic-dev/FAILURE_POLICY.md
+  - skills/marveen-agentic-dev/QUALITY_POLICY.md
+  - skills/marveen-agentic-dev/ROUTING_POLICY.md
+  - PROJECT_MEMORY.md
+
+# === VERIFIKÁCIÓ ===
+verification:
+  passed: 6
+  failed: 0
+
+# === AKTUÁLIS HIBA (null ha nincs) ===
+current_failure: null
+
+# === KÖVETKEZŐ LÉPÉS (one-line, resumable) ===
+next_action: TASK-0008: create decisions/ + ADR-0001.md (Phase 1 implementation decision)
+
+# === MINIMUM REQUIRED CONTEXT (resume-hoz) ===
+context_required:
+  - skills/marveen-agentic-dev/SKILL.md
+  - skills/marveen-agentic-dev/TASK_SCHEMA.yaml
+  - PROJECT_MEMORY.md
+  - store/.dashboard-token (memory + daily-log API)
+
+# === VÉGREHAJTÁSI KONTEXTUS ===
+execution_context:
+  branch: develop
+  phase: 1-standard-work
+  current_EPIC: EPIC-MARVEEN-AGENTIC-OS (Phase 1: Standard Work)
+  next_TASKS:
+    - TASK-0008: decisions/ + ADR-0001.md (Phase 1 implementation decision)
+    - TASK-0009: validate Phase 1 + checkpoint (Git commit + state update)
+
+# === NYITOTT SZÁLAK (Phase 1-en kívül) ===
+open_threads:
+  - Holnap 10:00-kor HAOS reboot (GRUB timeout=300 aktiválódik) -- Telegram üzenet az eredményről
+  - Phase 2 (Local AI Gateway): Ollama + local Qwen integráció a `src/qwen-router.ts`-on át (már létezik, de a Context Gate Phase 3-ban jön)
+  - Phase 3 (Context Gate): deterministic search + vector retrieval + Qwen relevance filter + min context assembly
+  - Phase 4 (Dynamic Model Escalation): Sonnet/Opus split (jelenleg minden szint Opus a .env-ben)
+
+# === METRIKÁK (Phase 1) ===
+metrics:
+  tasks_done: 6
+  tasks_remaining_in_phase_1: 2
+  files_created: 8
+  lines_added_total_approx: 1200
+  llm_calls: 4       # TASK-0001 inspect, TASK-0002 conflicts, TASK-0003 SKILL+SCHEMA, TASK-0004 WORKFLOW
+  cloud_calls: 4     # all from the main Opus session
+  local_qwen_calls: 0
+  repair_attempts: 0
+  first_pass_success: true
