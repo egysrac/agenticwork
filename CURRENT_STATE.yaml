@@ -4,10 +4,10 @@
 # Keep concise (max ~ 50 sor). Update after every TASK DONE / BLOCKED.
 # Séma: TASK_SCHEMA.yaml `context_required` + `next_action` mezők.
 
-active_task: TASK-0011
+active_task: TASK-0013
 status: running
 
-# === DONE TASK-OK (Phase 1 + Phase 2 elsők) ===
+# === DONE TASK-OK (Phase 1 + Phase 2) ===
 completed:
   - TASK-0001: inspect Marveen architecture (top-level + store + src + skills + kanban)
   - TASK-0002: identify conflicts + preserve working capabilities
@@ -18,7 +18,9 @@ completed:
   - TASK-0007: CURRENT_STATE.yaml (resume-from-context)
   - TASK-0008: decisions/ADR-0001.md (Phase 1 implementation decision)
   - TASK-0009: validate Phase 1 + git checkpoint (commit 209aa30) + state update (commit d32b0f6)
-  - TASK-0010: .env Sonnet/Opus split -- ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (service restart TASK-0013-ban)
+  - TASK-0010: .env ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (commit 0766b3a)
+  - TASK-0011: src/qwen-router.ts relevanceFilter() függvény (batch + fallback, commit a5136c8)
+  - TASK-0012: .env DEFAULT_AGENT_MODEL=claude-sonnet-4-6 + ADR-0002.md draft
 
 # === MÓDOSÍTOTT FÁJLOK ===
 files_modified:
@@ -32,30 +34,40 @@ files_modified:
   - PROJECT_MEMORY.md
   - CURRENT_STATE.yaml
   - decisions/ADR-0001.md
-  - .env                                                       # TASK-0010 (DONE, not in git -- .gitignore)
-  - src/config.ts                                              # TASK-0011 (TBD)
-  - src/qwen-router.ts                                         # TASK-0011 (TBD)
+  - decisions/ADR-0002.md
+  - .env                                                       # TASK-0010/12 (.gitignore-ban)
+  - src/qwen-router.ts                                         # TASK-0011 (commit a5136c8)
 
 # === VERIFIKÁCIÓ ===
 verification:
-  passed: 10
+  passed: 12
   failed: 0
-  git_commit_phase_1: 209aa30
-  git_commit_state_update: d32b0f6
+  git_commits:
+    - 209aa30 (Phase 1 skill package + state)
+    - d32b0f6 (Phase 1 state update)
+    - 0766b3a (TASK-0010: ANTHROPIC_DEFAULT_SONNET_MODEL Sonnet)
+    - a5136c8 (TASK-0011: relevanceFilter() in src/qwen-router.ts)
   task_0010_manual_verify:
     env_line_set: ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (grep-verified)
     model_env_keys_contains_sonnet: src/web/routes/background-tasks.ts:34 (grep-verified)
-    build_model_env_reads_process_env: true (kódból látható)
-    typecheck_passed: true (npm run typecheck, 2026-09-01T23:19Z)
-    project_memory_documented: true (Cloud model sor frissítve)
-    unit_test_blocked: live-install guard -- worktree + TASK-0013 integrációs teszt
-  unrelated_files_preserved: 10 (5 modified + 5 untracked, NOT in commit)
+    typecheck_passed: true
+  task_0011_manual_verify:
+    relevance_filter_added: true (RelevanceChunk, RelevanceResult, RelevanceFilterOptions, relevanceFilter())
+    typecheck_passed: true (npm run typecheck, 2026-09-01T23:25Z)
+    complete_classify_unchanged: true (csak hozzáadás, nem módosítás)
+    batch_fallback_logic: true (batch JSON parse + per-chunk classify fallback)
+  task_0012_manual_verify:
+    env_line_set: DEFAULT_AGENT_MODEL=claude-sonnet-4-6 (grep-verified)
+    project_memory_updated: true (Cloud model sor)
+    adr_0002_drafted: true (decisions/ADR-0002.md)
+  unit_tests_pending: TASK-0013 worktree + integration test
+  service_restart_pending: true (TASK-0013-ban, 22:00-02:00 vagy 08:50-22:00)
 
 # === AKTUÁLIS HIBA (null ha nincs) ===
 current_failure: null
 
 # === KÖVETKEZŐ LÉPÉS (one-line, resumable) ===
-next_action: TASK-0011 in progress -- src/config.ts + src/qwen-router.ts Context Gate integráció (relevance filter a Qwen-en)
+next_action: TASK-0013 in progress -- worktree + HA NUC integration test + MiniMax proxy Sonnet elérhetőség + service restart (22:00-02:00 ablakban)
 
 # === MINIMUM REQUIRED CONTEXT (resume-hoz) ===
 context_required:
@@ -64,9 +76,10 @@ context_required:
   - skills/marveen-agentic-dev/ROUTING_POLICY.md
   - PROJECT_MEMORY.md
   - decisions/ADR-0001.md
+  - decisions/ADR-0002.md
   - store/.dashboard-token (memory + daily-log API)
-  - src/qwen-router.ts (a Context Gate integráció alapja)
-  - src/config.ts (a DEFAULT_AGENT_MODEL Sonnet-re állítása)
+  - src/qwen-router.ts (relevanceFilter)
+  - .env (Sonnet split, .gitignore-ban)
 
 # === VÉGREHAJTÁSI KONTEXTUS ===
 execution_context:
@@ -74,13 +87,13 @@ execution_context:
   phase: 2-local-ai-gateway
   current_EPIC: EPIC-MARVEEN-AGENTIC-OS (Phase 2: Local AI Gateway)
   next_TASKS:
-    - TASK-0011: src/config.ts + src/qwen-router.ts Context Gate integráció (relevance filter)
-    - TASK-0012: Min context assembly + token budget enforcement
-    - TASK-0013: Phase 2 verification (worktree + integration test against HA NUC + service restart)
-    - TASK-0014: Phase 2 checkpoint + ADR-0002
+    - TASK-0013: Phase 2 verification (worktree + integration test + service restart)
+    - TASK-0014: Phase 2 checkpoint + ADR-0002 final
   checkpoints:
     - 209aa30 (Phase 1 skill package + state)
     - d32b0f6 (Phase 1 state update)
+    - 0766b3a (TASK-0010: ANTHROPIC_DEFAULT_SONNET_MODEL)
+    - a5136c8 (TASK-0011: relevanceFilter)
   approval_received: 2026-09-01T22:11Z (Alex: "Kezdheted")
 
 # === PRIORITÁS-VÉDELEM (ABSZOLÚT) ===
@@ -90,6 +103,7 @@ priority_protection:
       cron: "7 2 * * *"
       type: dream-engine
       enabled: true
+      next_run: 2026-09-02T00:07Z (kb. 38 perc múlva)
     - name: reggeli-napindito
       cron: "7 2 * * *"
       type: dream-engine (fájlba ír)
@@ -103,8 +117,9 @@ priority_protection:
       cron: "*/10 6-8 * * *"
       type: task (ön-javító monitor)
       enabled: true
-  service_restart_window: 22:00-02:00 vagy 08:50-22:00 (a 02:07-06:00 időablak TILTOTT)
-  last_verified: 2026-09-01T23:19Z
+  service_restart_window: 22:00-02:00 (most) vagy 08:50-22:00
+  service_restart_deadline: 2026-09-02T00:07Z ELŐTT (a dream-engine előtt) VAGY 2026-09-02T06:50Z UTÁN
+  last_verified: 2026-09-01T23:30Z
 
 # === NYITOTT SZÁLAK ===
 open_threads:
@@ -113,19 +128,20 @@ open_threads:
   - Phase 4 (Dynamic Model Escalation): az L2/L3 split befejezése, cost monitoring
   - Phase 5 (Quality + PDCA): mért metrikák alapján a TASK-XXXX prefix konvenció finomítása
 
-# === METRIKÁK (Phase 1 záró + Phase 2 halad) ===
+# === METRIKÁK (Phase 1 + Phase 2 halad) ===
 metrics:
-  tasks_done: 10
-  tasks_remaining_in_phase_2: 4
-  files_created: 10
-  lines_added_total: 1580
+  tasks_done: 12
+  tasks_remaining_in_phase_2: 2
+  files_created: 11
+  lines_added_total: 1743           # 1580 (Phase 1) + 163 (relevanceFilter)
   llm_calls_phase_1: 4
   cloud_calls_phase_1: 4
   local_qwen_calls_phase_1: 0
   repair_attempts_phase_1: 0
   first_pass_success_phase_1: true
   fpy: 1.0
-  phase_2_progress: 1/5
-  cloud_calls_task_0010: 0  # csak manual verify + file edit
-  local_qwen_calls_task_0010: 0
-  service_restart_pending: true (TASK-0013-ban, a 02:07-06:00 időablakon kívül)
+  phase_2_progress: 3/5            # TASK-0010..0012 done
+  cloud_calls_phase_2: 0           # csak file edit + manual verify
+  local_qwen_calls_phase_2: 0       # worktree integrációs teszt TASK-0013-ban
+  service_restart_pending: true    # TASK-0013-ban
+  next_restart_window_opens: 2026-09-02T00:07Z ELŐTT (kb. 38 perc) VAGY 2026-09-02T06:50Z UTÁN
