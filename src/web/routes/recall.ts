@@ -1,6 +1,9 @@
 import { recallByDateRange, recallSearch, getDailyLogDates } from '../../db.js'
 import { MAIN_AGENT_ID, APP_TZ } from '../../config.js'
 import { json } from '../http-helpers.js'
+import { gateContext, assembleContext } from '../../context-gate.js'
+import type { RelevanceChunk } from '../../qwen-router.js'
+import { logger } from '../../logger.js'
 import type { RouteContext } from './types.js'
 
 const TZ = APP_TZ  // install zone (config.APP_TZ); was hardcoded Europe/Budapest
@@ -188,10 +191,16 @@ export async function tryHandleRecall(ctx: RouteContext): Promise<boolean> {
     const query = url.searchParams.get('q') || ''
     const agent = url.searchParams.get('agent') || undefined
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200)
+    // Context Gate (Phase 3): opt-in via ?gate=true. When enabled, the
+    // returned memories are filtered through gateContext() (deterministic
+    // pre-filter + qwen2.5:3b relevance filter) down to `gateTopK` most
+    // relevant. Default OFF so existing callers see no behavioral change.
+    const gate = url.searchParams.get('gate') === 'true'
+    const gateTopK = Math.min(Math.max(parseInt(url.searchParams.get('gateTopK') || '5', 10), 1), 20)
 
     if (query && !dateExpr) {
       const result = recallSearch(query, agent, limit)
-      const formatted = formatRecallResult(result)
+      const formatted = await maybeGateMemories(result, query, { enabled: gate, topK: gateTopK })
       json(res, formatted)
       return true
     }
@@ -211,7 +220,8 @@ export async function tryHandleRecall(ctx: RouteContext): Promise<boolean> {
       result.memories = result.memories.filter(m => m.content.toLowerCase().includes(qLower) || (m.keywords || '').toLowerCase().includes(qLower))
     }
 
-    json(res, formatRecallResult(result))
+    const formatted = await maybeGateMemories(result, query, { enabled: gate, topK: gateTopK })
+    json(res, formatted)
     return true
   }
 
@@ -225,7 +235,7 @@ export async function tryHandleRecall(ctx: RouteContext): Promise<boolean> {
   return false
 }
 
-function formatRecallResult(result: { logs: any[]; memories: any[]; dateRange: { from: string; to: string } }) {
+function formatRecallResult(result: { logs: any[]; memories: any[]; dateRange: { from: string; to: string } }, gateMeta?: { enabled: boolean; before: number; after: number; topK: number }) {
   return {
     dateRange: result.dateRange,
     logs: result.logs.map(l => ({
@@ -242,5 +252,65 @@ function formatRecallResult(result: { logs: any[]; memories: any[]; dateRange: {
       memoryCount: result.memories.length,
       agents: [...new Set([...result.logs.map(l => l.agent_id), ...result.memories.map(m => m.agent_id)])],
     },
+    gate: gateMeta ?? null,
   }
+}
+
+// Context Gate wrapper for the recall endpoint (Phase 3 / TASK-0016).
+// - When gate.enabled is false, returns the result unchanged.
+// - When the result has few memories (<= topK), returns unchanged (no benefit).
+// - When the gate errors or returns empty, returns the original list (degraded
+//   mode) so callers still get something -- the gate is a filter, not a gate.
+// - Adds a `gate: { enabled, before, after, topK }` field to the response so
+//   callers can see what was filtered.
+async function maybeGateMemories(
+  result: { logs: any[]; memories: any[]; dateRange: { from: string; to: string } },
+  query: string,
+  opts: { enabled: boolean; topK: number },
+): Promise<ReturnType<typeof formatRecallResult>> {
+  if (!opts.enabled) return formatRecallResult(result)
+  if (!query.trim()) return formatRecallResult(result)
+  const before = result.memories.length
+  if (before <= opts.topK) return formatRecallResult(result, { enabled: true, before, after: before, topK: opts.topK })
+
+  const candidates: RelevanceChunk[] = result.memories.map(m => ({
+    id: String(m.id),
+    content: m.content,
+  }))
+
+  let gateResult
+  try {
+    gateResult = await gateContext(query, candidates, {
+      topK: opts.topK,
+      cost: 'low',
+      deterministicMax: 20,
+    })
+  } catch (err) {
+    logger.warn({ err, query: query.slice(0, 80) }, 'recall: context gate failed, returning unfiltered memories')
+    return formatRecallResult(result, { enabled: true, before, after: before, topK: opts.topK })
+  }
+
+  if (gateResult.length === 0) {
+    return formatRecallResult(result, { enabled: true, before, after: before, topK: opts.topK })
+  }
+
+  const idsKept = new Set(gateResult.map(r => r.id))
+  const filteredMemories = result.memories.filter(m => idsKept.has(String(m.id)))
+  const after = filteredMemories.length
+
+  logger.info(
+    { query: query.slice(0, 80), before, after, topK: opts.topK },
+    'recall: context gate filtered memories',
+  )
+
+  // expose the assembled top-K context as a convenience for callers that
+  // want a single string instead of the structured memories
+  const assembled = assembleContext(gateResult, candidates) ?? undefined
+
+  const formatted = formatRecallResult(
+    { ...result, memories: filteredMemories },
+    { enabled: true, before, after, topK: opts.topK },
+  )
+  if (assembled) (formatted as any).assembledContext = assembled
+  return formatted
 }

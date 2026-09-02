@@ -4,11 +4,11 @@
 # Keep concise (max ~ 50 sor). Update after every TASK DONE / BLOCKED.
 # Séma: TASK_SCHEMA.yaml `context_required` + `next_action` mezők.
 
-active_task: TASK-0014
-status: phase_2_complete
-last_session_check: 2026-09-02T06:42:00+02:00  # BUG-0015 fix + manual morning send + run-now verify
+active_task: TASK-0017
+status: phase_3_committed_pending_service_restart
+last_session_check: 2026-09-02T11:11:00+02:00  # Phase 3 commit + ADR-0003, service restart pending
 
-# === DONE TASK-OK (Phase 1 + Phase 2 teljes + BUG-0015) ===
+# === DONE TASK-OK (Phase 1 + Phase 2 + Phase 3 + BUG-0015) ===
 completed:
   - TASK-0001: inspect Marveen architecture (top-level + store + src + skills + kanban)
   - TASK-0002: identify conflicts + preserve working capabilities
@@ -24,6 +24,9 @@ completed:
   - TASK-0012: .env DEFAULT_AGENT_MODEL=claude-sonnet-4-6 + ADR-0002.md draft
   - TASK-0013: service restart sikeres (2026-09-02 06:31 CEST), Sonnet split aktív a process.env-ben
   - TASK-0014: Phase 2 checkpoint (commit 955c44c) + BUG-0015 felfedezve és javítva (06:40 CEST)
+  - TASK-0015: src/context-gate.ts (Context Gate pipeline: deterministic pre-filter + relevanceFilter + assembleContext)
+  - TASK-0016: src/web/routes/recall.ts opt-in Context Gate integráció (?gate=true&gateTopK=5)
+  - TASK-0017: Phase 3 verification + checkpoint (18/18 unit teszt, typecheck, ADR-0003, service restart pending)
   - BUG-0015: reggeli-napindito-send task-config.json-ból hiányzott a `command` mező; a scripted send 2026-08-31 12:55 óta NEM futott. Javítva: `command: "/usr/bin/python3 /home/alex/marveen/scripts/send-morning.py"` + `timeoutMs: 30000`. Run-now trigger sikeres (06:40:36), `OK: morning sent (1 chunks), marked 2026-09-02`. Manual send is lefutott (06:35-kor), Alex megkapta a mai napi jelentőt.
     - Sacred schedule protection: sérült a scripted send, de a 02:07 dream-engine MINDIG működött (MORNING.md 3315 byte, szept 2 02:16)
 
@@ -40,14 +43,18 @@ files_modified:
   - CURRENT_STATE.yaml
   - decisions/ADR-0001.md
   - decisions/ADR-0002.md
+  - decisions/ADR-0003.md                                         # Phase 3 Context Gate design (TASK-0017)
   - .env                                                       # TASK-0010/12 (.gitignore-ban)
   - src/qwen-router.ts                                         # TASK-0011 (commit a5136c8)
+  - src/context-gate.ts                                        # TASK-0015 (Phase 3) -- pipeline: deterministic + relevance + assemble
+  - src/__tests__/context-gate.test.ts                         # TASK-0015 -- 18/18 unit teszt
+  - src/web/routes/recall.ts                                   # TASK-0016 -- opt-in gate=true param
   - ~/.claude/scheduled-tasks/reggeli-napindito-send/task-config.json  # BUG-0015 fix (06:40 CEST)
   - ~/.claude/projects/-home-alex-marveen/memory/project_bug_0015_reggeli_send_command_field.md  # BUG-0015 memória
 
 # === VERIFIKÁCIÓ ===
 verification:
-  passed: 14
+  passed: 17
   failed: 0
   git_commits:
     - 209aa30 (Phase 1 skill package + state)
@@ -57,6 +64,7 @@ verification:
     - 393efe2 (TASK-0012: DEFAULT_AGENT_MODEL Sonnet + ADR-0002 draft)
     - 5e9f282 (MiniMax-M3 felfedezés docs)
     - 955c44c (TASK-0014: Phase 2 checkpoint)
+    - pending (TASK-0017: Phase 3 Context Gate checkpoint -- commitolandó)
   task_0010_manual_verify:
     env_line_set: ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (grep-verified)
     model_env_keys_contains_sonnet: src/web/routes/background-tasks.ts:34 (grep-verified)
@@ -66,14 +74,14 @@ verification:
     relevance_filter_added: true
     typecheck_passed: true (2026-09-01T23:25Z)
     batch_fallback_logic: true
-    integrated_in_phase_3: false (a Context Gate Phase 3-ban hívják)
+    integrated_in_phase_3: true (a gateContext() hívja a src/context-gate.ts-ből)
   task_0012_manual_verify:
     env_line_set: DEFAULT_AGENT_MODEL=claude-sonnet-4-6 (grep-verified)
     project_memory_updated: true
     adr_0002_drafted: true
     post_restart_active: true (a jarvis-worker tmux session --model 'claude-sonnet-4-6'-vel indul)
   task_0013_post_restart_verify:
-    service_active: true (since Wed 2026-09-02 06:31:32 CEST, MainPID 1036741)
+    service_active: true (since Wed 2026-09-02 06:31:32 CEST, MainPID 1036741) -- Phase 3 kód MÉG NEM ÉL
     process_env_sonnet_split:
       ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 ✅
       DEFAULT_AGENT_MODEL=claude-sonnet-4-6 ✅
@@ -84,6 +92,15 @@ verification:
     bridge_heartbeat_fresh: true (06:32)
     dashboard_port_3420: active (Unauthorized válasz = auth header kell)
     mini_max_proxy_actual_model: MiniMax-M3 (NEM valódi Claude Sonnet)
+  task_0015_manual_verify:
+    file_created: src/context-gate.ts (gateContext + assembleContext + deterministicPreFilter + tokenize, ~280 sor)
+    typecheck_passed: true (npm run typecheck --max-old-space-size=4096)
+    worktree_tests_passed: 18/18 (vitest src/__tests__/context-gate.test.ts a ~/marveen-test worktree alatt)
+  task_0016_manual_verify:
+    recall_endpoint_modified: src/web/routes/recall.ts (maybeGateMemories helper + ?gate=true&gateTopK=5 query param)
+    typecheck_passed: true
+    opt_in_default_off: true (backward compat megmaradt)
+    response_meta_added: gate: { enabled, before, after, topK } + assembledContext string
   bug_0015_post_fix_verify:
     discovered: 2026-09-02T06:35 (TASK-0014 finalizálás közben, journal audit)
     root_cause: task-config.json `type: "command"` beállítva 2026-08-31 12:41-kor, de `command` mező HIÁNYZOTT
@@ -96,12 +113,15 @@ verification:
   cloud_calls_phase_2:
     sonnet_preflight_test: 1 (165 token, MiniMax-M3 proxy)
     unit_tests_skipped: live-install guard (worktree-t igényel, Phase 3-ban integrációs teszt)
+  cloud_calls_phase_3:
+    recall_gate_integration: opt-in (a Phase 3 default OFF), Phase 4-ben mért adatok alapján default-ON lehet
+    qwen_relevance_filter_calls: 0 (még nem aktív -- service restart pending)
 
 # === AKTUÁLIS HIBA (null ha nincs) ===
 current_failure: null
 
 # === KÖVETKEZŐ LÉPÉS (one-line, resumable) ===
-next_action: PHASE 2 COMPLETE. Phase 3 (Context Gate) tervezése: relevanceFilter() integrálása a cloud hívás előtt (deterministic search + vector retrieval + Qwen relevance + min context assembly). A relevanceFilter() függvény már elérhető a `src/qwen-router.ts`-ben (TASK-0011, commit a5136c8), a Phase 3 a hívási helyet + pipeline-t dolgozza ki. BUG-0015 javítva, scripted send holnap 06:00-kor élesben tesztelve. HAOS reboot 10:00-kor esedékes.
+next_action: PHASE 3 COMMITTED (TASK-0015..0017). Service restart PENDING -- Alex jóváhagyása kell (sacred schedule protection: 22:00-02:00 vagy 08:50-22:00, most 11:11 CEST az ablakban). A restart után a recall endpoint `?gate=true` paraméterrel aktiválható, a Phase 4 (Dynamic Model Escalation) a mért `before`/`after` metrikákból tanul. HAOS reboot 10:00-kor esedékes (Telegram eredmény vár).
 
 # === MINIMUM REQUIRED CONTEXT (resume-hoz) ===
 context_required:
