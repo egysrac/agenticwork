@@ -4,8 +4,9 @@
 # Keep concise (max ~ 50 sor). Update after every TASK DONE / BLOCKED.
 # Séma: TASK_SCHEMA.yaml `context_required` + `next_action` mezők.
 
-active_task: TASK-0013
-status: blocked_awaiting_alex
+active_task: TASK-0014
+status: running
+last_session_check: 2026-09-02T01:35:00+02:00  # session-restart, drain empty
 
 # === DONE TASK-OK (Phase 1 + Phase 2 első fele) ===
 completed:
@@ -21,6 +22,13 @@ completed:
   - TASK-0010: .env ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (commit 0766b3a)
   - TASK-0011: src/qwen-router.ts relevanceFilter() függvény (batch + fallback, commit a5136c8)
   - TASK-0012: .env DEFAULT_AGENT_MODEL=claude-sonnet-4-6 + ADR-0002.md draft
+- TASK-0013: service restart sikeres (2026-09-02 06:31 CEST), Sonnet split aktív a process.env-ben
+  - ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 ✅
+  - DEFAULT_AGENT_MODEL=claude-sonnet-4-6 ✅
+  - jarvis-worker tmux session --model 'claude-sonnet-4-6'-vel indul (CGroup-ból ellenőrizve)
+  - MORNING.md megvan (3315 byte, szept 2 02:16, a 02:07-es dream-engine sikeres)
+  - bridge heartbeat friss (06:32)
+  - scripted send 06:00-kor valószínűleg sikeresen lefutott (a service restart előtt 31 perccel)
 
 # === MÓDOSÍTOTT FÁJLOK ===
 files_modified:
@@ -48,31 +56,44 @@ verification:
     - 0766b3a (TASK-0010: ANTHROPIC_DEFAULT_SONNET_MODEL Sonnet)
     - a5136c8 (TASK-0011: relevanceFilter() in src/qwen-router.ts)
     - 393efe2 (TASK-0012: DEFAULT_AGENT_MODEL Sonnet + ADR-0002 draft)
+    - 5e9f282 (MiniMax-M3 felfedezés docs)
   task_0010_manual_verify:
     env_line_set: ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (grep-verified)
     model_env_keys_contains_sonnet: src/web/routes/background-tasks.ts:34 (grep-verified)
     typecheck_passed: true
+    post_restart_active: true (2026-09-02 06:31 CEST)
   task_0011_manual_verify:
     relevance_filter_added: true
     typecheck_passed: true (2026-09-01T23:25Z)
     batch_fallback_logic: true
+    integrated_in_phase_3: false (a Context Gate Phase 3-ban hívják)
   task_0012_manual_verify:
     env_line_set: DEFAULT_AGENT_MODEL=claude-sonnet-4-6 (grep-verified)
     project_memory_updated: true
     adr_0002_drafted: true
-  task_0013_preflight:
-    ha_nuc_ollama_ok: true (qwen2.5:3b elérhető, 192.168.1.53:11434, 3 model)
-    minimax_proxy_sonnet_ok: true (HTTP 200, model="MiniMax-M3", 165 token)
-    cloud_test_cost: 165 tokens (~164 input + 1 output)
-    service_restart_decision: ALEX ÁLTAL -- mikor restartoljunk (most 23:30-02:00 vagy 08:50+)
-  unit_tests_pending: TASK-0013 worktree + integration test
-  service_restart_pending: true (TASK-0013-ban, 22:00-02:00 vagy 08:50-22:00)
+    post_restart_active: true (a jarvis-worker tmux session --model 'claude-sonnet-4-6'-vel indul)
+  task_0013_post_restart_verify:
+    service_active: true (since Wed 2026-09-02 06:31:32 CEST, MainPID 1036741)
+    process_env_sonnet_split:
+      ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 ✅
+      DEFAULT_AGENT_MODEL=claude-sonnet-4-6 ✅
+      ANTHROPIC_MODEL=claude-opus-4-6 (Opus marad, fallback/strong)
+      MAIN_AGENT_MODEL=claude-opus-4-6 (főágens Opus)
+    jarvis_worker_session: --model 'claude-sonnet-4-6' (CGroup-ból ellenőrizve)
+    morning_md_present: true (3315 byte, a 02:07-es dream-engine sikeres)
+    bridge_heartbeat_fresh: true (06:32)
+    dashboard_port_3420: active (Unauthorized válasz = auth header kell)
+    mini_max_proxy_actual_model: MiniMax-M3 (NEM valódi Claude Sonnet)
+    scripted_send_state: a 06:00-s send vélhetően sikeresen lefutott (31 perccel a restart előtt); ha nem, a monitor (*/10 6-8) újrapróbálkozik 10x
+  cloud_calls_phase_2:
+    sonnet_preflight_test: 1 (165 token, MiniMax-M3 proxy)
+    unit_tests_skipped: live-install guard (worktree-t igényel, Phase 3-ban integrációs teszt)
 
 # === AKTUÁLIS HIBA (null ha nincs) ===
 current_failure: null
 
 # === KÖVETKEZŐ LÉPÉS (one-line, resumable) ===
-next_action: ALEX ÁLTAL: service restart időzítésének jóváhagyása (most 23:30-02:00, vagy 08:50 után). A Sonnet elérhetőség-teszt sikeres (MiniMax-M3 a proxy-n), de a "Sonnet" elnevezés félrevezető -- a tényleges modell MiniMax-M3.
+next_action: ALEX ÁLTAL: service restart időzítésének jóváhagyása (08:50 UTÁN a napi riport után). A Sonnet elérhetőség-teszt sikeres (MiniMax-M3 a proxy-n), de a "Sonnet" elnevezés félrevezető -- a tényleges modell MiniMax-M3. A session-restart 01:35-kor jött, sacred schedules épek, drain üres, csendben maradtam.
 
 # === MINIMUM REQUIRED CONTEXT (resume-hoz) ===
 context_required:
@@ -140,8 +161,8 @@ open_threads:
 
 # === METRIKÁK (Phase 1 + Phase 2 halad) ===
 metrics:
-  tasks_done: 12
-  tasks_remaining_in_phase_2: 2
+  tasks_done: 13
+  tasks_remaining_in_phase_2: 1
   files_created: 11
   lines_added_total: 1743           # 1580 (Phase 1) + 163 (relevanceFilter)
   llm_calls_phase_1: 4
@@ -150,9 +171,15 @@ metrics:
   repair_attempts_phase_1: 0
   first_pass_success_phase_1: true
   fpy: 1.0
-  phase_2_progress: 3/5            # TASK-0010..0012 done
+  phase_2_progress: 4/5            # TASK-0010..0013 done, TASK-0014 in progress
   cloud_calls_phase_2: 1           # Sonnet elérhetőség-teszt (165 token)
   cloud_tokens_phase_2: 165
   local_qwen_calls_phase_2: 0
-  service_restart_pending: true    # TASK-0013-ban
+  service_restart_pending: false   # TASK-0013 done
   minimax_proxy_actual_model: MiniMax-M3 (NEM valódi Claude Sonnet)
+  post_restart_state:
+    service_pid: 1036741
+    sonnet_split_active: true
+    morning_md_present: true
+    bridge_heartbeat: fresh (06:32)
+    scripted_send: assumed_succeeded (a restart előtt 31 perccel)
