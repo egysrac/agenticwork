@@ -121,7 +121,7 @@ verification:
 current_failure: null
 
 # === KÖVETKEZŐ LÉPÉS (one-line, resumable) ===
-next_action: PHASE 3 COMMITTED (TASK-0015..0017). Service restart PENDING -- Alex jóváhagyása kell (sacred schedule protection: 22:00-02:00 vagy 08:50-22:00, most 11:11 CEST az ablakban). A restart után a recall endpoint `?gate=true` paraméterrel aktiválható, a Phase 4 (Dynamic Model Escalation) a mért `before`/`after` metrikákból tanul. HAOS reboot 10:00-kor esedékes (Telegram eredmény vár).
+next_action: PHASE 2.1 + PHASE 3 LIVE. Phase 2.1 (commit 28572ec) bezárta a BUG-0015 5. rétegét: command-task.ts silent skip → fail + fails++ + failThreshold alert; schedule-runner.ts runScheduledTaskNow type==='command' ág → runCommandTask. Phase 3 (commit 374287c + Phase 2.1 együttes build) a recall endpoint `?gate=true&gateTopK=N` query paraméterrel aktiválható -- 17 candidates → Qwen qwen2.5:3b relevance filter → N top-K + assembledContext string. 18/18 unit test átment worktree-ben. SCHEDPRESEND826 buffer-leak fix is a Phase 2.1 commit részeként véglegesítve (agent-process.ts + schedule-runner.ts pre-send buffer-clear guard). Service PID 1110001 fut, MORNING.md 3315 byte, bridge heartbeat friss, scripted send 06:00 cron-driven main loop úton fut (run-now endpoint is). Következő: Phase 4 (Dynamic Model Escalation) a mért `before`/`after` metrikákból tanul. HAOS reboot 10:00-kor esedékes.
 
 # === MINIMUM REQUIRED CONTEXT (resume-hoz) ===
 context_required:
