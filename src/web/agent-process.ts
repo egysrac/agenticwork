@@ -2018,6 +2018,21 @@ export function sendEnterToSession(session: string, host: string | null = null):
   }
 }
 
+// SCHEDPRESEND826: send Ctrl-U to a session. Used by the schedule-runner
+// pre-send buffer-clear guard when detectPaneState reads idle (so
+// clearStaleParkedInput bails on its 'typing' requirement) but the prompt-
+// line still has parked text from a previous failed delivery. C-u is the
+// standard tmux clear-input shortcut.
+export function sendCtrlUToSession(session: string, host: string | null = null): boolean {
+  try {
+    runTmux(host, ['send-keys', '-t', session, 'C-u'], { timeout: 5000 })
+    return true
+  } catch (err) {
+    logger.warn({ err, session }, 'sendCtrlUToSession: failed to send recovery Ctrl-U')
+    return false
+  }
+}
+
 // Capture a pane snapshot with an execSync timeout. Null on any error so
 // the caller can treat "capture failed" as "not ready".
 export function capturePane(session: string, host: string | null = null): string | null {

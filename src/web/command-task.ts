@@ -79,21 +79,12 @@ function runCommand(cmd: string, timeoutMs: number): { ok: boolean; detail: stri
   }
 }
 
-export function runCommandTask(task: ScheduledTask, now: number): void {
-  if (!task.command) {
-    logger.warn({ task: task.name }, "command task has no command, skipping")
-    return
-  }
-  const timeoutMs = task.timeoutMs && task.timeoutMs > 0 ? task.timeoutMs : 10_000
-  const failThreshold = task.failThreshold && task.failThreshold > 0 ? task.failThreshold : 2
-  const map = load()
-  const { ok, detail } = runCommand(task.command, timeoutMs)
-  const { next, action } = evaluateCommandResult(map[task.name], ok, failThreshold, now)
-  map[task.name] = next
-  persist()
-  try { appendTaskRun(task.name, task.agent || "system") } catch { /* non-fatal */ }
-  logger.info({ task: task.name, ok, detail, fails: next.fails, action }, "command task ran")
-
+function sendCommandTaskAlert(
+  task: ScheduledTask,
+  action: CommandAction,
+  detail: string,
+  fails: number,
+): void {
   if (action === "none") return
   const ownerChat = resolveOwnerChatId()
   if (!TELEGRAM_BOT_TOKEN || !ownerChat) {
@@ -102,9 +93,42 @@ export function runCommandTask(task: ScheduledTask, now: number): void {
   }
   const label = task.description || task.name
   const text = action === "alert"
-    ? `\u{1F534} Hiba: ${label} nem v\u00e1laszol (${next.fails}. egym\u00e1s ut\u00e1ni hiba). R\u00e9szlet: ${detail}`
+    ? `\u{1F534} Hiba: ${label} nem v\u00e1laszol (${fails}. egym\u00e1s ut\u00e1ni hiba). R\u00e9szlet: ${detail}`
     : `\u{1F7E2} Helyre\u00e1llt: ${label} ism\u00e9t OK.`
   sendTelegramMessage(TELEGRAM_BOT_TOKEN, ownerChat, text)
     .then(() => logger.info({ task: task.name, action }, "command task alert sent"))
     .catch((err) => logger.warn({ err, task: task.name }, "command task alert send failed"))
+}
+
+export function runCommandTask(task: ScheduledTask, now: number): void {
+  const failThreshold = task.failThreshold && task.failThreshold > 0 ? task.failThreshold : 2
+
+  // Guard: missing `command` field is treated as a hard failure so the
+  // failThreshold counter actually increments and the Telegram alert
+  // fires on the configured threshold. The previous silent skip let
+  // scripted tasks go dark for days (BUG-0015, 2026-09-02: scripted
+  // send was missing its `command` field for 33+ hours with no trace).
+  if (!task.command) {
+    logger.error(
+      { task: task.name, failThreshold },
+      "command task has NO command field -- treating as failure (failThreshold will escalate)",
+    )
+    const map = load()
+    const { next, action } = evaluateCommandResult(map[task.name], false, failThreshold, now)
+    map[task.name] = next
+    persist()
+    try { appendTaskRun(task.name, task.agent || "system", "failed") } catch { /* non-fatal */ }
+    sendCommandTaskAlert(task, action, "command field missing", next.fails)
+    return
+  }
+
+  const timeoutMs = task.timeoutMs && task.timeoutMs > 0 ? task.timeoutMs : 10_000
+  const map = load()
+  const { ok, detail } = runCommand(task.command, timeoutMs)
+  const { next, action } = evaluateCommandResult(map[task.name], ok, failThreshold, now)
+  map[task.name] = next
+  persist()
+  try { appendTaskRun(task.name, task.agent || "system") } catch { /* non-fatal */ }
+  logger.info({ task: task.name, ok, detail, fails: next.fails, action }, "command task ran")
+  sendCommandTaskAlert(task, action, detail, next.fails)
 }

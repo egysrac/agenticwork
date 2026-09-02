@@ -45,7 +45,9 @@ import {
   sessionExistsOnHost,
   capturePane,
   sendEnterToSession,
+  sendCtrlUToSession,
   clearStaleParkedInput,
+  delay,
 } from './agent-process.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { sendTelegramMessage } from './telegram.js'
@@ -280,6 +282,17 @@ export function isScheduledPromptStuck(pane: string | null, marker: string): boo
   if (idx < 0) return false
   const inputRegion = pane.slice(idx)
   return /❯\s+\S/.test(inputRegion) && inputRegion.includes(marker)
+}
+
+// SCHEDPRESEND826: generic parked-input detector -- no marker dependency,
+// so it catches ANY fragment left from a previous failed delivery. Used by
+// the pre-send buffer-clear guard below.
+export function hasParkedInputLine(pane: string | null): boolean {
+  if (!pane || !pane.trim()) return false
+  const idx = pane.lastIndexOf('❯')
+  if (idx < 0) return false
+  const inputRegion = pane.slice(idx)
+  return /❯\s+\S/.test(inputRegion)
 }
 
 // --- Schedule Runner ---
@@ -772,6 +785,56 @@ async function attemptFireTask(
     // task aimed at a long-busy session would block on the 12s idle wait every
     // tick -- defeating the very purpose of forceSend (inject regardless, let
     // Claude Code queue it). All non-forceSend tasks keep the gate ON.
+    // SCHEDPRESEND826: pre-send buffer-clear guard for non-forceSend tasks.
+    // A parked input fragment that survives the waitForIdle gate can swallow
+    // the new prompt into a non-empty box and produce a silent 'lost'
+    // delivery (16-20% rate on memoria-heartbeat / ledger-live-drain,
+    // observed 2026-08-31). sendPromptToSession's internal pre-flight only
+    // handles truncated preamble, so we add a parallel guard here. forceSend
+    // has its own pre-guard higher up (no_repeat_buffer_leak); skipped to
+    // avoid double-clears.
+    if (!task.forceSend) {
+      // SCHEDPRESEND826 wedge-detektor: a session 100% context-en van
+      // (wedged), a waitForPaneIdle megis 'idle'-t ad a masodik capture-re
+      // (a context-saturation banner eltunik, de a session attol meg nem
+      // tud valaszolni). Ilyenkor a sendPromptToSession atengedne a
+      // sendKeys-et, de a session nem reagalt ra, es a watchdog 'lost'-nak
+      // jelolte (2026-08-31, lost rate memoria-heartbeat 21.1% /
+      // ledger-live-drain 26.9% meg a PRE-send buffer-clear guard utan is).
+      // A fix: a PRE-send guard elott ellenorizzuk a
+      // paneShowsContextSaturation-t (ugyanaz a helper, amit a forceSend
+      // branch is hasznal a schedule-runner.ts:670-674-ban), es ha wedged,
+      // a retry queue-ba irunk + return 'busy'. A retry queue a
+      // context-guard runner altal inditott ujrainditas utan fogja
+      // feloldani -- a 'wedge-skip' reason-nel kerult rekord egy tervezett
+      // skip, nem egy csendben elveszett delivery, szemben a 'lost'-tal.
+      const wedgePane = capturePane(session, host)
+      if (wedgePane != null && paneShowsContextSaturation(wedgePane)) {
+        logger.warn(
+          { task: task.name, agent: agentName, session },
+          'pre-send wedge detected: session context-saturated (100%), deferring to retry queue instead of injecting into a wedged session',
+        )
+        insertPendingTaskRetryIfNew(task.name, agentName, now, 'wedge-skip')
+        return 'busy'
+      }
+
+      const preGuard = await withSessionSendLock(session, host, 'recover', async (): Promise<void> => {
+        const prePane = capturePane(session, host)
+        if (prePane != null && hasParkedInputLine(prePane)) {
+          logger.warn(
+            { task: task.name, agent: agentName, session },
+            'pre-send buffer-clear: parked input line detected, sending Ctrl-U',
+          )
+          sendCtrlUToSession(session, host)
+          await delay(150)
+        }
+      })
+      if (!preGuard.ran) {
+        logger.info({ task: task.name, session }, 'pre-send buffer-clear skipped: pane send lane busy -- deferring to retry queue')
+        insertPendingTaskRetryIfNew(task.name, agentName, now, 'presend-skip')
+        return 'busy'
+      }
+    }
     await sendPromptToSession(session, fullPrompt, host, { waitForIdle: !task.forceSend })
     scheduleLastRun.set(task.name, now)
     persistScheduleLastRun()
@@ -931,6 +994,13 @@ export function taskInjectionRank(t: Pick<ScheduledTask, 'forceSend' | 'type'>):
 // for it). Reuses attemptFireTask, so a stopped agent is auto-started and the
 // prompt is queued for delivery exactly like a real cron fire. Returns a
 // per-target summary string for the API/UI.
+//
+// type:'command' tasks have their own execution path (raw shell command via
+// runCommandTask) and never go through the LLM/tmux trigger pipeline -- the
+// attemptFireTask path would silently route them to the agent session with
+// `fired` status but never actually run the shell command, masking failures
+// (5th layer of BUG-0015, 2026-09-02). Branch here so run-now honors the
+// same type semantics as the cron-driven main loop.
 export async function runScheduledTaskNow(
   taskName: string,
   opts: { allowDisabled?: boolean } = {},
@@ -943,6 +1013,20 @@ export async function runScheduledTaskNow(
   if (!task.enabled && !opts.allowDisabled) return { ok: false, error: 'Schedule is disabled' }
 
   const now = Date.now()
+
+  // Command-type tasks: run the raw shell command directly via runCommandTask
+  // (same path the cron-driven main loop uses at schedule-runner.ts:1488-1493).
+  // The function is synchronous; success/failure is reflected in
+  // command-task-health.json + the 'failed' status of the appended task_run
+  // row. Mark scheduleLastRun so the next cron tick won't re-fire it as a
+  // catch-up.
+  if (task.type === 'command') {
+    runCommandTask(task, now)
+    scheduleLastRun.set(task.name, now)
+    persistScheduleLastRun()
+    return { ok: true, result: `command: ran` }
+  }
+
   const targets = task.agent === 'all'
     ? [MAIN_AGENT_ID, ...listAgentNames().filter(a => isAgentRunning(a))]
     : [task.agent || MAIN_AGENT_ID]
