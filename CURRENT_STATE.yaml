@@ -5,10 +5,10 @@
 # Séma: TASK_SCHEMA.yaml `context_required` + `next_action` mezők.
 
 active_task: TASK-0014
-status: running
-last_session_check: 2026-09-02T01:35:00+02:00  # session-restart, drain empty
+status: phase_2_complete
+last_session_check: 2026-09-02T06:42:00+02:00  # BUG-0015 fix + manual morning send + run-now verify
 
-# === DONE TASK-OK (Phase 1 + Phase 2 első fele) ===
+# === DONE TASK-OK (Phase 1 + Phase 2 teljes + BUG-0015) ===
 completed:
   - TASK-0001: inspect Marveen architecture (top-level + store + src + skills + kanban)
   - TASK-0002: identify conflicts + preserve working capabilities
@@ -22,13 +22,10 @@ completed:
   - TASK-0010: .env ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (commit 0766b3a)
   - TASK-0011: src/qwen-router.ts relevanceFilter() függvény (batch + fallback, commit a5136c8)
   - TASK-0012: .env DEFAULT_AGENT_MODEL=claude-sonnet-4-6 + ADR-0002.md draft
-- TASK-0013: service restart sikeres (2026-09-02 06:31 CEST), Sonnet split aktív a process.env-ben
-  - ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 ✅
-  - DEFAULT_AGENT_MODEL=claude-sonnet-4-6 ✅
-  - jarvis-worker tmux session --model 'claude-sonnet-4-6'-vel indul (CGroup-ból ellenőrizve)
-  - MORNING.md megvan (3315 byte, szept 2 02:16, a 02:07-es dream-engine sikeres)
-  - bridge heartbeat friss (06:32)
-  - scripted send 06:00-kor valószínűleg sikeresen lefutott (a service restart előtt 31 perccel)
+  - TASK-0013: service restart sikeres (2026-09-02 06:31 CEST), Sonnet split aktív a process.env-ben
+  - TASK-0014: Phase 2 checkpoint (commit 955c44c) + BUG-0015 felfedezve és javítva (06:40 CEST)
+  - BUG-0015: reggeli-napindito-send task-config.json-ból hiányzott a `command` mező; a scripted send 2026-08-31 12:55 óta NEM futott. Javítva: `command: "/usr/bin/python3 /home/alex/marveen/scripts/send-morning.py"` + `timeoutMs: 30000`. Run-now trigger sikeres (06:40:36), `OK: morning sent (1 chunks), marked 2026-09-02`. Manual send is lefutott (06:35-kor), Alex megkapta a mai napi jelentőt.
+    - Sacred schedule protection: sérült a scripted send, de a 02:07 dream-engine MINDIG működött (MORNING.md 3315 byte, szept 2 02:16)
 
 # === MÓDOSÍTOTT FÁJLOK ===
 files_modified:
@@ -45,10 +42,12 @@ files_modified:
   - decisions/ADR-0002.md
   - .env                                                       # TASK-0010/12 (.gitignore-ban)
   - src/qwen-router.ts                                         # TASK-0011 (commit a5136c8)
+  - ~/.claude/scheduled-tasks/reggeli-napindito-send/task-config.json  # BUG-0015 fix (06:40 CEST)
+  - ~/.claude/projects/-home-alex-marveen/memory/project_bug_0015_reggeli_send_command_field.md  # BUG-0015 memória
 
 # === VERIFIKÁCIÓ ===
 verification:
-  passed: 12
+  passed: 14
   failed: 0
   git_commits:
     - 209aa30 (Phase 1 skill package + state)
@@ -57,6 +56,7 @@ verification:
     - a5136c8 (TASK-0011: relevanceFilter() in src/qwen-router.ts)
     - 393efe2 (TASK-0012: DEFAULT_AGENT_MODEL Sonnet + ADR-0002 draft)
     - 5e9f282 (MiniMax-M3 felfedezés docs)
+    - 955c44c (TASK-0014: Phase 2 checkpoint)
   task_0010_manual_verify:
     env_line_set: ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 (grep-verified)
     model_env_keys_contains_sonnet: src/web/routes/background-tasks.ts:34 (grep-verified)
@@ -84,7 +84,15 @@ verification:
     bridge_heartbeat_fresh: true (06:32)
     dashboard_port_3420: active (Unauthorized válasz = auth header kell)
     mini_max_proxy_actual_model: MiniMax-M3 (NEM valódi Claude Sonnet)
-    scripted_send_state: a 06:00-s send vélhetően sikeresen lefutott (31 perccel a restart előtt); ha nem, a monitor (*/10 6-8) újrapróbálkozik 10x
+  bug_0015_post_fix_verify:
+    discovered: 2026-09-02T06:35 (TASK-0014 finalizálás közben, journal audit)
+    root_cause: task-config.json `type: "command"` beállítva 2026-08-31 12:41-kor, de `command` mező HIÁNYZOTT
+    last_successful_send_fire: 2026-08-31 12:55:23 CEST (utána SEMMI, 6 bejegyzés összesen a run history-ban)
+    fix_applied: 2026-09-02T06:40 (command + timeoutMs hozzáadva)
+    run_now_fire: 2026-09-02T06:40:36 ✅ (Scheduled task fired: reggeli-napindito-send, "OK: morning sent (1 chunks)")
+    manual_send_backup: 2026-09-02T06:35 (python3 /home/alex/marveen/scripts/send-morning.py) -- Alex megkapta a mai napi jelentőt
+    sacred_schedule_violated: scripted send 2026-08-31 12:55 - 2026-09-02 06:35 (33+ óra); dream-engine MINDIG működött, MORNING.md mindig friss
+    next_fire_test: 2026-09-03T05:00Z (holnap reggel 06:00 CEST scripted send)
   cloud_calls_phase_2:
     sonnet_preflight_test: 1 (165 token, MiniMax-M3 proxy)
     unit_tests_skipped: live-install guard (worktree-t igényel, Phase 3-ban integrációs teszt)
@@ -93,7 +101,7 @@ verification:
 current_failure: null
 
 # === KÖVETKEZŐ LÉPÉS (one-line, resumable) ===
-next_action: ALEX ÁLTAL: service restart időzítésének jóváhagyása (08:50 UTÁN a napi riport után). A Sonnet elérhetőség-teszt sikeres (MiniMax-M3 a proxy-n), de a "Sonnet" elnevezés félrevezető -- a tényleges modell MiniMax-M3. A session-restart 01:35-kor jött, sacred schedules épek, drain üres, csendben maradtam.
+next_action: PHASE 2 COMPLETE. Phase 3 (Context Gate) tervezése: relevanceFilter() integrálása a cloud hívás előtt (deterministic search + vector retrieval + Qwen relevance + min context assembly). A relevanceFilter() függvény már elérhető a `src/qwen-router.ts`-ben (TASK-0011, commit a5136c8), a Phase 3 a hívási helyet + pipeline-t dolgozza ki. BUG-0015 javítva, scripted send holnap 06:00-kor élesben tesztelve. HAOS reboot 10:00-kor esedékes.
 
 # === MINIMUM REQUIRED CONTEXT (resume-hoz) ===
 context_required:
@@ -122,8 +130,11 @@ execution_context:
     - 0766b3a (TASK-0010)
     - a5136c8 (TASK-0011)
     - 393efe2 (TASK-0012)
+    - 955c44c (TASK-0014: Phase 2 checkpoint)
   approval_received: 2026-09-01T22:11Z (Alex: "Kezdheted")
-  service_restart_decision_pending: 2026-09-01T23:32Z (Alex-szel egyeztetés alatt)
+  restart_approval_received: 2026-09-02T04:32Z (Alex: "Mehet a restart")
+  service_restart_executed: 2026-09-02T06:31:32 CEST (MainPID 1036741)
+  bug_0015_fix_autonomous: routine_trivial_fix autonomy level 3 -- "deli/reggeli rutin trivialis javitasai"
 
 # === PRIORITÁS-VÉDELEM (ABSZOLÚT) ===
 priority_protection:
@@ -155,31 +166,35 @@ priority_protection:
 # === NYITOTT SZÁLAK ===
 open_threads:
   - HAOS reboot scheduled 2026-09-02 10:00 (GRUB timeout=300) -- Telegram üzenet az eredményről
+  - BUG-0015 fix verification: holnap 2026-09-03 06:00 scripted send tűz (első "éles" teszt a javítás után)
   - Phase 3 (Context Gate teljes pipeline): deterministic search + vector retrieval + Qwen relevance filter + min context assembly
   - Phase 4 (Dynamic Model Escalation): az L2/L3 split befejezése, cost monitoring
   - Phase 5 (Quality + PDCA): mért metrikák alapján a TASK-XXXX prefix konvenció finomítása
 
-# === METRIKÁK (Phase 1 + Phase 2 halad) ===
+# === METRIKÁK (Phase 1 + Phase 2 + BUG-0015) ===
 metrics:
-  tasks_done: 13
-  tasks_remaining_in_phase_2: 1
-  files_created: 11
-  lines_added_total: 1743           # 1580 (Phase 1) + 163 (relevanceFilter)
+  tasks_done: 14
+  tasks_remaining_in_phase_2: 0     # Phase 2 COMPLETE
+  bugs_fixed: 1                      # BUG-0015
+  files_created: 12                  # +1 BUG-0015 memory file
+  lines_added_total: 1743            # 1580 (Phase 1) + 163 (relevanceFilter)
   llm_calls_phase_1: 4
   cloud_calls_phase_1: 4
   local_qwen_calls_phase_1: 0
   repair_attempts_phase_1: 0
   first_pass_success_phase_1: true
   fpy: 1.0
-  phase_2_progress: 4/5            # TASK-0010..0013 done, TASK-0014 in progress
+  phase_2_progress: 5/5            # TASK-0010..0014 done
   cloud_calls_phase_2: 1           # Sonnet elérhetőség-teszt (165 token)
   cloud_tokens_phase_2: 165
   local_qwen_calls_phase_2: 0
   service_restart_pending: false   # TASK-0013 done
   minimax_proxy_actual_model: MiniMax-M3 (NEM valódi Claude Sonnet)
+  bug_0015_mttr: 45 min             # 06:35 felfedezés - 06:40 javítás - 06:40 run-now verify
+  scripted_send_manual_send_count: 1  # 06:35 manual send, Alex megkapta
   post_restart_state:
     service_pid: 1036741
     sonnet_split_active: true
     morning_md_present: true
-    bridge_heartbeat: fresh (06:32)
-    scripted_send: assumed_succeeded (a restart előtt 31 perccel)
+    bridge_heartbeat: fresh (06:35)
+    scripted_send_state: manual_sent_06:35 + scheduled_run_now_verified_06:40 (a holnapi 06:00 tűz lesz az első "éles" teszt)
