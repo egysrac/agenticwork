@@ -1,5 +1,6 @@
 import { ImapFlow, type ImapFlowOptions } from 'imapflow'
 import nodemailer, { type Transporter } from 'nodemailer'
+import MailComposer from 'nodemailer/lib/mail-composer/index.js'
 import { simpleParser, type Attachment } from 'mailparser'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -802,28 +803,29 @@ export interface SendResult {
   rejected: string[]
 }
 
-// Send via Gmail SMTP XOAUTH2. Requires the gmail.send scope; throws if it
-// is missing (NEVER falls back to the IMAP app-password transport -- the
-// audit trail is the whole point of using XOAUTH2).
+// Send via the Gmail REST API's users.messages.send (raw RFC822, base64url).
+// Requires the gmail.send scope; throws if it is missing (NEVER falls back
+// to the IMAP app-password transport -- the audit trail is the whole point
+// of using XOAUTH2).
+//
+// NOTE (2026-09-05, fixed after a live 535 "Username and Password not
+// accepted" failure): this used to open a raw SMTP connection to
+// smtp.gmail.com with nodemailer's OAuth2 transport. That protocol requires
+// the FULL-MAILBOX scope `https://mail.google.com/` -- the narrower
+// `gmail.send` scope this app is actually granted (store/.google-oauth.json)
+// authenticates fine against the Gmail REST API but is REJECTED by the raw
+// SMTP/IMAP servers, which don't recognize REST-API-only scopes. Composing
+// the MIME message locally (nodemailer's MailComposer, no network I/O) and
+// POSTing it to gmail.googleapis.com/.../messages/send avoids SMTP entirely
+// and works with the scope already on file -- no re-consent needed.
 export async function sendEmail(input: SendInput): Promise<SendResult> {
   if (!_hasScope('https://www.googleapis.com/auth/gmail.send')) {
     throw new Error('sendEmail: gmail.send scope missing in store/.google-oauth.json -- refusing to send')
   }
   const fromAddress = await _ensureSmtpUsername()
-  // Refresh the access_token if it's about to expire (the SMTP socket opens
-  // NOW, not later). nodemailer doesn't auto-refresh for OAuth2.
   const accessToken = await _accessToken()
-  const transport = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: true,
-    auth: {
-      type: 'OAuth2',
-      user: fromAddress,
-      accessToken,
-    },
-  })
-  const info = await transport.sendMail({
+
+  const mail = new MailComposer({
     from: fromAddress,
     to: input.to,
     cc: input.cc,
@@ -834,10 +836,35 @@ export async function sendEmail(input: SendInput): Promise<SendResult> {
     inReplyTo: input.inReplyTo,
     references: input.references,
   })
+  const raw: Buffer = await new Promise((resolve, reject) => {
+    mail.compile().build((err: Error | null, message: Buffer) => {
+      if (err) reject(err)
+      else resolve(message)
+    })
+  })
+  const rawB64Url = raw.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+
+  const { status, data } = await _httpRequest(
+    'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    },
+    JSON.stringify({ raw: rawB64Url }),
+  )
+  if (status !== 200) {
+    throw new Error(`sendEmail: Gmail API send failed: HTTP ${status} ${data.slice(0, 300)}`)
+  }
+  const parsed = JSON.parse(data) as { id?: string; threadId?: string }
+  const recipients = ([] as string[]).concat(
+    input.to ? (Array.isArray(input.to) ? input.to : [input.to]) : [],
+    input.cc ? (Array.isArray(input.cc) ? input.cc : [input.cc]) : [],
+    input.bcc ? (Array.isArray(input.bcc) ? input.bcc : [input.bcc]) : [],
+  )
   return {
-    messageId: info.messageId,
-    accepted: Array.isArray(info.accepted) ? info.accepted.map(String) : [],
-    rejected: Array.isArray(info.rejected) ? info.rejected.map(String) : [],
+    messageId: parsed.id ?? '',
+    accepted: recipients,
+    rejected: [],
   }
 }
 
@@ -1065,6 +1092,212 @@ export async function extractInvoiceData(
     return null
   }
   return validateInvoiceData(raw, sourceEmailId)
+}
+
+// === Andi contextual auto-reply (TRIAGE826-ANDI-INTERPRET) ===
+
+// Decode one base64url-encoded Gmail payload `body.data` blob. Gmail uses
+// URL-safe base64 (RFC 4648 §5) -- `-`/`_` instead of `+`/`/`, no padding.
+// We normalise to standard base64 before Buffer.from so Node does not throw.
+function decodeGmailBodyData(data: string): string {
+  if (!data) return ''
+  const normalised = data.replace(/-/g, '+').replace(/_/g, '/')
+  const padded = normalised + '='.repeat((4 - (normalised.length % 4)) % 4)
+  try {
+    return Buffer.from(padded, 'base64').toString('utf-8')
+  } catch {
+    return ''
+  }
+}
+
+// Walk a Gmail message payload and return the best plain-text body we can
+// find. Order of preference: text/plain -> text/html (tags stripped) -> ''.
+// The payload tree is recursive -- multipart/alternative wraps multipart/related
+// wraps text/html -- so we walk the full tree, preferring text/plain parts.
+function extractTextFromPayload(payload: any): string {
+  if (!payload || typeof payload !== 'object') return ''
+  const mime = String(payload.mimeType ?? '').toLowerCase()
+  // Leaf with body data: return the decoded text.
+  if (payload.body && typeof payload.body.data === 'string' && payload.body.data.length > 0) {
+    const decoded = decodeGmailBodyData(payload.body.data)
+    if (mime === 'text/plain') return decoded
+    if (mime === 'text/html') return decoded.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+    return decoded
+  }
+  // Container: recurse into parts.
+  if (Array.isArray(payload.parts)) {
+    // Prefer text/plain over text/html over anything else.
+    const plain = payload.parts.find((p: any) => String(p?.mimeType ?? '').toLowerCase() === 'text/plain')
+    if (plain) {
+      const t = extractTextFromPayload(plain)
+      if (t) return t
+    }
+    const html = payload.parts.find((p: any) => String(p?.mimeType ?? '').toLowerCase() === 'text/html')
+    if (html) {
+      const t = extractTextFromPayload(html)
+      if (t) return t
+    }
+    for (const p of payload.parts) {
+      const t = extractTextFromPayload(p)
+      if (t) return t
+    }
+  }
+  return ''
+}
+
+// Fetch the full body of a Gmail message (text/plain preferred, text/html as
+// fallback). Uses the OAuth bearer token + the same retry-once-on-401 pattern
+// as the rest of the OAuth helpers. Returns the From envelope (decoded),
+// Subject, threadId, and the plain-text body -- everything the LLM prompt
+// needs.
+export interface GmailMessageDetail {
+  fromEnvelope: string
+  subject: string
+  threadId: string
+  bodyText: string
+}
+
+export async function _getMessageDetail(messageId: string): Promise<GmailMessageDetail | null> {
+  const token = await _accessToken()
+  const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}?format=full`
+  const { status, data } = await _httpRequest(url, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  let parsed: any
+  try {
+    parsed = JSON.parse(data)
+  } catch {
+    parsed = null
+  }
+  if (status === 401 && parsed) {
+    const newToken = await refreshAccessToken()
+    const retry = await _httpRequest(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${newToken}` },
+    })
+    if (retry.status !== 200) return null
+    parsed = JSON.parse(retry.data)
+  } else if (status !== 200) {
+    return null
+  }
+  if (!parsed) return null
+  const fromHeader = parsed.payload?.headers?.find((h: any) => h.name?.toLowerCase() === 'from')?.value ?? ''
+  const subject = parsed.payload?.headers?.find((h: any) => h.name?.toLowerCase() === 'subject')?.value ?? ''
+  const bodyText = extractTextFromPayload(parsed.payload)
+  return {
+    fromEnvelope: decodeMimeHeader(fromHeader),
+    subject: decodeMimeHeader(subject),
+    threadId: parsed.threadId ?? '',
+    bodyText,
+  }
+}
+
+// LLM prompt for the Andi contextual reply generator. The system prompt
+// locks the response shape to a single JSON object so the runner can rely on
+// it. The "small talk, no commitments" rule is the load-bearing safety
+// constraint -- Alex will see the reply in his Sent folder later, and the
+// reply must not promise anything (date / place / amount / yes/no) that an
+// LLM made up out of thin air.
+const ANDI_REPLY_SYSTEM = `You generate a short, friendly auto-reply in Hungarian on behalf of Alex to an email he received from Andi (zavada.andrea@gmail.com). Respond with a single JSON object, nothing else, no prose, no markdown fences:
+{"summary":"<1-2 sentences, what Andi's email is about, in Hungarian>","reply":"<the reply text Alex sends, in Hungarian>"}
+Rules:
+- summary: 1-2 sentences, in Hungarian, describes what Andi's email is about. Include the key question / topic / ask so the runner can audit the reply later.
+- reply: 2-5 short sentences, signed "Üdv,\nJarvis AI" (this is the assistant signing, NOT Alex in person -- the SMTP envelope is still Alex's mailbox, but the body must identify the author as the assistant so Andi knows the answer is automated). It MUST acknowledge that the email was read and that a real answer is coming -- NEVER invent a date, time, place, amount, or yes/no decision. If Andi's email asks a concrete question that needs Alex's input, the reply must say so explicitly (e.g. "ezt még át kell gondolnom, este írok rendesen").
+- If the email is empty / not human-readable, reply with exactly: null`
+
+export interface AndiReplyDraft {
+  summary: string
+  reply: string
+}
+
+export function validateAndiReplyDraft(raw: unknown): AndiReplyDraft | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  const summary = typeof r['summary'] === 'string' ? r['summary'].trim() : ''
+  const reply = typeof r['reply'] === 'string' ? r['reply'].trim() : ''
+  if (!summary || !reply) return null
+  if (summary.length > 500) return null
+  if (reply.length > 2000) return null
+  // Sanity: the reply must end with the "Jarvis AI" signature -- if the LLM
+  // dropped it, the runner would send an unsigned email, which is an obvious
+  // tell that this is an auto-reply. The signature is "Jarvis AI" (the AI
+  // assistant), NOT "Alex" -- even though the SMTP envelope is Alex's
+  // mailbox, the body must identify the author as the assistant so Andi
+  // knows the answer is automated. The regex accepts "Jarvis AI" with any
+  // whitespace between the words and tolerates a trailing newline.
+  if (!/Jarvis(\s+AI)?\s*$/.test(reply)) return null
+  return { summary, reply }
+}
+
+// Generate a contextual reply draft for one Andi email. Returns null on any
+// failure (network / non-JSON / schema-invalid). The caller (runner) logs
+// the raw LLM output via logger.info for auditability, mirroring
+// extractInvoiceData.
+export async function extractAndiReply(
+  emailBody: string,
+  fromHeader: string,
+  sourceEmailId: string,
+): Promise<AndiReplyDraft | null> {
+  const baseUrl = (process.env['ANTHROPIC_BASE_URL'] ?? '').replace(/\/+$/, '')
+  const authToken = process.env['ANTHROPIC_AUTH_TOKEN'] ?? process.env['AUTH_TOKEN'] ?? ''
+  const model = process.env['ANTHROPIC_MODEL'] ?? 'MiniMax-M3'
+  if (!baseUrl || !authToken) {
+    logger.warn('extractAndiReply: ANTHROPIC_BASE_URL or ANTHROPIC_AUTH_TOKEN not set, returning null')
+    return null
+  }
+  const userPayload = `From: ${fromHeader}\n\nBody:\n${emailBody.slice(0, 8000)}`
+  const body = {
+    model,
+    max_tokens: 512,
+    system: ANDI_REPLY_SYSTEM,
+    messages: [{ role: 'user', content: userPayload }],
+  }
+  const url = `${baseUrl}/v1/messages`
+  let data: string
+  try {
+    const { status, data: respData } = await _httpRequest(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': authToken,
+        'anthropic-version': '2023-06-01',
+      },
+    }, body)
+    if (status !== 200) {
+      logger.warn({ status, body: respData.slice(0, 200) }, 'extractAndiReply: LLM non-200')
+      return null
+    }
+    data = respData
+  } catch (e) {
+    logger.warn({ err: (e as Error).message }, 'extractAndiReply: LLM request failed')
+    return null
+  }
+  logger.info({ sourceEmailId, llmRaw: data.slice(0, 1000) }, 'extractAndiReply: LLM response')
+
+  let text: string
+  try {
+    const parsed = JSON.parse(data) as { content?: Array<{ type?: string; text?: string }> }
+    const block = parsed.content?.find(b => b.type === 'text')
+    text = block?.text ?? ''
+  } catch {
+    return null
+  }
+  if (!text) return null
+
+  const stripped = text.trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```\s*$/i, '')
+    .trim()
+
+  if (stripped === 'null') return null
+  let raw: unknown
+  try {
+    raw = JSON.parse(stripped)
+  } catch {
+    return null
+  }
+  return validateAndiReplyDraft(raw)
 }
 
 // Setup helper (legacy, kept for parity with the old API).
