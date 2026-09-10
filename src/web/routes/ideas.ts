@@ -156,13 +156,16 @@ export async function tryHandleIdeas(ctx: RouteContext): Promise<boolean> {
     if (!idea) { json(res, { error: 'Ötlet nem található' }, 404); return true }
 
     const cardId = randomUUID().slice(0, 8)
-    const status = phase === 'plan' ? 'planned' : 'waiting'
+    // Idea promotion is intake, not a direct transition into BLOCKED. The old
+    // detail phase used legacy waiting; under TASK-0019 it starts at NEW so a
+    // human/agent can explicitly decide READY or BLOCKED through /move.
+    const state = phase === 'plan' ? 'ready' : 'new'
     const title = phase === 'plan' ? idea.title : `[Részlet kidolgozás] ${idea.title}`
     createKanbanCard({
       id: cardId,
       title,
       description: idea.description ?? '',
-      status,
+      state,
       priority: 'normal',
       assignee: BOT_NAME,
       project: 'Fejlesztési ötletek',

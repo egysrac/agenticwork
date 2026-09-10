@@ -22,7 +22,7 @@ import { AGENTS_BASE_DIR, listAgentNames } from './agent-config.js'
 import { safeJoin } from './sanitize.js'
 import { SCHEDULED_TASKS_DIR } from './scheduled-tasks-io.js'
 import { getBindings } from './vault-bindings.js'
-import { getDb, backfillEmbeddings } from '../db.js'
+import { getDb, backfillEmbeddings, insertImportedKanbanCard } from '../db.js'
 import { logger } from '../logger.js'
 
 // ---------------------------------------------------------------------------
@@ -1102,14 +1102,7 @@ export function importFleet(
         if (!c.id || !c.title || !c.status || !c.priority || c.sort_order == null) {
           logger.warn({ id: c.id }, 'Fleet import: skipping kanban card with missing required fields'); continue
         }
-        db.prepare(
-          `INSERT OR IGNORE INTO kanban_cards
-           (id, title, description, status, assignee, priority, project,
-            due_date, sort_order, created_at, updated_at, archived_at, parent_id, dispatched_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(c.id, c.title, c.description ?? null, c.status, c.assignee ?? null,
-          c.priority, c.project ?? null, c.due_date ?? null, c.sort_order,
-          c.created_at, c.updated_at, c.archived_at ?? null, c.parent_id ?? null, c.dispatched_at ?? null)
+        insertImportedKanbanCard(c)
       }
 
       // kanban comments (idempotent: card_id + content)
@@ -1126,10 +1119,15 @@ export function importFleet(
       for (const ev of fleet.kanban?.cardEvents ?? []) {
         const e = ev as any
         if (!e.card_id || !e.to_status) continue
-        if (!db.prepare('SELECT 1 FROM kanban_card_events WHERE card_id = ? AND created_at = ? AND to_status = ?')
-          .get(e.card_id, e.created_at, e.to_status)) {
-          db.prepare('INSERT INTO kanban_card_events (card_id, from_status, to_status, actor, created_at) VALUES (?, ?, ?, ?, ?)')
-            .run(e.card_id, e.from_status ?? null, e.to_status, e.actor, e.created_at)
+        if (!db.prepare(`SELECT 1 FROM kanban_card_events
+          WHERE card_id = ? AND created_at = ? AND to_status = ? AND COALESCE(to_state,'') = COALESCE(?,'')`)
+          .get(e.card_id, e.created_at, e.to_status, e.to_state ?? null)) {
+          db.prepare(`INSERT INTO kanban_card_events
+            (card_id, from_status, to_status, actor, created_at, from_state, to_state, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+              e.card_id, e.from_status ?? null, e.to_status, e.actor, e.created_at,
+              e.from_state ?? null, e.to_state ?? null, e.reason ?? null,
+            )
         }
       }
 

@@ -41,6 +41,9 @@ vi.mock('../web/atomic-write.js', () => ({
 
 vi.mock('../db.js', () => ({
   appendTaskRun: vi.fn(),
+  persistTaskOutputObligation: vi.fn(),
+  listTaskOutputObligations: vi.fn(() => []),
+  deleteTaskOutputObligation: vi.fn(),
   listPendingTaskRetries: () => mockListPendingRetries(),
   deletePendingTaskRetry: (...a: unknown[]) => mockDeletePendingRetry(...a),
   updatePendingTaskRetry: () => mockUpdatePendingRetry(),

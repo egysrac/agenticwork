@@ -21,6 +21,9 @@ import {
   markPendingTaskRetryAlert,
   clearPendingTaskRetryAlert,
   markScheduledTaskKanbanWaiting,
+  persistTaskOutputObligation,
+  listTaskOutputObligations,
+  deleteTaskOutputObligation,
 } from '../db.js'
 import { toPendingRetryView, classifyTelegramSendError, type PendingRetryView } from '../pending-retries.js'
 import {
@@ -56,6 +59,12 @@ import { decideQuotaAction, type QuotaWorkClass } from '../quota-gate.js'
 import { readQuotaSnapshot } from '../quota-snapshot.js'
 import { paneShowsContextSaturation, detectsFirstRunGate, detectPaneState, type PaneState } from '../pane-state.js'
 import { withSessionSendLock } from './session-send-lock.js'
+import {
+  captureExpectedOutput,
+  expectedOutputPath,
+  verifyExpectedOutput,
+  type ExpectedOutputSnapshot,
+} from './schedule-output-verifier.js'
 
 // How many bare-Enter attempts the post-send resubmit tries before escalating
 // to a clear + re-inject, and the hard cap after which it gives up.
@@ -92,7 +101,24 @@ const RESUBMIT_LANE_BUSY_MAX_SKIPS = 20
 //
 // Maximum tracking age: entries that age past TASK_FIRE_MAX_TRACK_MS are
 // evicted regardless, so a permanently stuck agent does not accumulate entries.
-export const TASK_FIRE_GRACE_MS = 30_000
+//
+// Was 30_000 until 2026-09-07 (LEDGERLIVE907): on a busy shared session (a
+// fast heartbeat like ledger-live-drain competing with other scheduled tasks
+// for the same jarvis-channels pane), the swallowed-Enter recovery path below
+// (setTimeout(resubmit, 2000) then up to RESUBMIT_MAX_ATTEMPTS more attempts
+// 3s apart, i.e. up to ~17s before it gives up or lands via reinject) plus the
+// agent's own turn time (10-30s observed for a trivial "read one file, ack"
+// heartbeat once actually picked up) routinely added up to MORE than 30s end
+// to end -- confirmed live: ledger-live-drain's task_runs log showed 'lost' at
+// elapsedMs:30002 (i.e. the pane went idle and sawTurn was still false at
+// almost exactly the old boundary), and a follow-up retry's prompt was
+// observed landing in the session transcript 28.6s after its own "Scheduled
+// task fired" log line -- 1.3s under the old 30s grace, explaining why even
+// retries kept flipping between 'lost' and 'fired' every ~30s instead of
+// settling. 60s gives the full recovery chain + a normal turn comfortable
+// room; a genuinely wedged session (the 2026-08-23 case this grace period
+// guards against) is still caught, just one sweep later than before.
+export const TASK_FIRE_GRACE_MS = 60_000
 export const TASK_FIRE_TIMEOUT_MS = 300_000
 const TASK_FIRE_MAX_TRACK_MS = 6 * 60 * 60_000
 
@@ -120,6 +146,9 @@ export interface TaskInflightEntry {
   // during the sweep so an edit to the schedule mid-run cannot move the
   // goalposts under an already-running injection.
   timeoutMs: number
+  // Only populated for explicitly supported file-preparation tasks. Captured
+  // before prompt delivery so an unchanged output can never count as success.
+  expectedOutput?: ExpectedOutputSnapshot | null
 }
 
 // How long a fired task may stay busy before the watchdog calls it stuck.
@@ -151,6 +180,62 @@ export function resolveStuckTimeoutMs(
 
 // Active task/heartbeat injections keyed by `${taskName}@${agentName}`.
 const taskInflightMap = new Map<string, TaskInflightEntry>()
+
+export function recoverTaskOutputObligations(): TaskInflightEntry[] {
+  const recovered: TaskInflightEntry[] = []
+  for (const row of listTaskOutputObligations()) {
+    // Treat SQLite as durable state, not as authority to inspect an arbitrary
+    // path after restart. Only obligations matching today's exact allowlist
+    // and the captured working directory are recoverable.
+    const canonicalOutput = expectedOutputPath(row.task_name, PROJECT_ROOT)
+    const canonicalWorkingDir = row.agent_name === MAIN_AGENT_ID ? PROJECT_ROOT : agentDir(row.agent_name)
+    const canonicalConfigDir = row.agent_name === MAIN_AGENT_ID
+      ? null
+      : (readAgentClaudeConfigDir(row.agent_name) ?? null)
+    if (
+      row.output_path !== canonicalOutput ||
+      row.working_dir !== canonicalWorkingDir ||
+      row.config_dir !== canonicalConfigDir
+    ) {
+      logger.error(
+        { task: row.task_name, agent: row.agent_name, output: row.output_path },
+        'Discarding invalid scheduled-task output obligation path',
+      )
+      deleteTaskOutputObligation(row.task_name, row.agent_name, row.injected_at)
+      continue
+    }
+    const key = `${row.task_name}@${row.agent_name}`
+    const current = taskInflightMap.get(key)
+    if (current && current.injectedAt >= row.injected_at) continue
+    const entry: TaskInflightEntry = {
+      taskName: row.task_name, agentName: row.agent_name, session: row.session,
+      host: row.host, injectedAt: row.injected_at, alerted: false, sawTurn: false,
+      workingDir: row.working_dir, configDir: row.config_dir ?? undefined,
+      timeoutMs: row.timeout_ms,
+      expectedOutput: { path: row.output_path, fingerprint: row.output_fingerprint },
+    }
+    taskInflightMap.set(key, entry)
+    recovered.push(entry)
+  }
+  return recovered
+}
+
+export function settleExpectedOutput(entry: TaskInflightEntry, now: number): void {
+  const output = verifyExpectedOutput(entry.expectedOutput)
+  if (!output.applicable) return
+  if (!output.ok) {
+    logger.error(
+      { task: entry.taskName, agent: entry.agentName, session: entry.session, output: output.path, reason: output.reason },
+      'Scheduled file-preparation task finished without refreshing its expected output -- recording failure and re-queueing',
+    )
+    appendTaskRun(entry.taskName, entry.agentName, output.reason)
+    insertPendingTaskRetryIfNew(entry.taskName, entry.agentName, now, output.reason)
+  } else {
+    appendTaskRun(entry.taskName, entry.agentName, 'output-verified')
+    logger.info({ task: entry.taskName, agent: entry.agentName, output: output.path }, 'Scheduled file-preparation task refreshed its expected output')
+  }
+  deleteTaskOutputObligation(entry.taskName, entry.agentName, entry.injectedAt)
+}
 
 export type TaskTimeoutDecision = 'clear' | 'alert' | 'hold' | 'lost'
 
@@ -609,6 +694,7 @@ async function attemptFireTask(
   lateCatchUpMs?: number,
 ): Promise<'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing' | 'first-run'> {
   const { session, host } = resolveTaskTarget(task, agentName)
+  const expectedOutput = captureExpectedOutput(task.name, task.expectedOutputFile)
 
   if (!sessionExistsOnHost(host, session)) {
     // Auto-start the agent, then deliver on a later tick. A daily batch agent
@@ -741,8 +827,15 @@ async function attemptFireTask(
       // than to deliver to the wrong chat, and the warn below makes the
       // config gap visible. The system-level pending-retry alert further
       // down still uses ALLOWED_CHAT_ID by design.
-      const boundChatId = resolveBoundChatId(agentName)
-      if (boundChatId) {
+      if (expectedOutput) {
+        // Explicitly opted-in, allowlisted file-preparation tasks produce an
+        // artifact only. Keeping every delivery directive out of their prompt
+        // makes freshness retries safe: a retry cannot duplicate a Telegram
+        // notification. The separate sender, where one exists, owns delivery.
+        prefix = `[Utemezett feladat: ${task.name}] Keszitsd elo es ird ki a ${expectedOutput.path} fajlt. Telegram uzenetet ne kuldj; ez kizarolag fajl-elokeszito feladat.`
+      } else {
+        const boundChatId = resolveBoundChatId(agentName)
+        if (boundChatId) {
         // The main agent (jarvis) has NO working native-channels "reply tool":
         // the plugin's telegram MCP server requires claude.ai OAuth
         // (Kq()?.accessToken) to register at all, which this MiniMax/API-key
@@ -756,12 +849,13 @@ async function attemptFireTask(
         // Sub-agents are left on the "reply tool" wording for now since their
         // channel setup differs per-agent and hasn't been confirmed broken the
         // same way; revisit if/when they get their own curl-based bridges.
-        prefix = agentName === MAIN_AGENT_ID
-          ? `[Utemezett feladat: ${task.name}] Nincs mukodo Telegram "reply tool" -- az OAuth-ot igenylo natív channels plugin ezen a MiniMax-flottan nem tud csatlakozni. Az eredmenyt Bot API curl hivassal kuldd el: TOKEN=$(grep TELEGRAM_BOT_TOKEN /home/alex/marveen/.env | cut -d= -f2) && curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" -d "chat_id=${boundChatId}" --data-urlencode "text=A SZOVEG" > /dev/null. `
-          : `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el Telegramon (chat_id: ${boundChatId}, reply tool). `
-      } else {
-        logger.warn({ task: task.name, agent: agentName }, 'scheduled task: agent has no bound telegram chat (access.json missing/empty) -- prompt omits the Telegram delivery instruction')
-        prefix = `[Utemezett feladat: ${task.name}] `
+          prefix = agentName === MAIN_AGENT_ID
+            ? `[Utemezett feladat: ${task.name}] Nincs mukodo Telegram "reply tool" -- az OAuth-ot igenylo natív channels plugin ezen a MiniMax-flottan nem tud csatlakozni. Az eredmenyt Bot API curl hivassal kuldd el: TOKEN=$(grep TELEGRAM_BOT_TOKEN /home/alex/marveen/.env | cut -d= -f2) && curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" -d "chat_id=${boundChatId}" --data-urlencode "text=A SZOVEG" > /dev/null. `
+            : `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el Telegramon (chat_id: ${boundChatId}, reply tool). `
+        } else {
+          logger.warn({ task: task.name, agent: agentName }, 'scheduled task: agent has no bound telegram chat (access.json missing/empty) -- prompt omits the Telegram delivery instruction')
+          prefix = `[Utemezett feladat: ${task.name}] `
+        }
       }
     }
     // A scheduled task body is the agent's OWN task, authored by the operator
@@ -835,9 +929,27 @@ async function attemptFireTask(
         return 'busy'
       }
     }
-    await sendPromptToSession(session, fullPrompt, host, { waitForIdle: !task.forceSend })
-    scheduleLastRun.set(task.name, now)
-    persistScheduleLastRun()
+    const injectedAt = Date.now()
+    const workingDir = agentName === MAIN_AGENT_ID ? PROJECT_ROOT : agentDir(agentName)
+    const configDir = agentName === MAIN_AGENT_ID ? undefined : (readAgentClaudeConfigDir(agentName) ?? undefined)
+    const timeoutMs = resolveStuckTimeoutMs(task)
+    const firedStatus = lateCatchUpMs != null ? 'fired_late' : 'fired'
+    // The durable obligation must exist before the first prompt byte can land.
+    // SQLite and tmux cannot share a transaction, so write-ahead is the only
+    // ordering that cannot lose completion tracking on a process crash.
+    if (expectedOutput) {
+      persistTaskOutputObligation({
+        taskName: task.name, agentName, injectedAt, session, host, workingDir,
+        configDir, timeoutMs, outputPath: expectedOutput.path,
+        outputFingerprint: expectedOutput.fingerprint,
+      })
+    }
+    try {
+      await sendPromptToSession(session, fullPrompt, host, { waitForIdle: !task.forceSend })
+    } catch (err) {
+      if (expectedOutput) deleteTaskOutputObligation(task.name, agentName, injectedAt)
+      throw err
+    }
     // A lateCatchUpMs value means this tick only matched because of the
     // enlarged first-run catch-up window (see startScheduleRunner), i.e. the
     // task missed its normal tick (e.g. the process was down/restarting at
@@ -848,14 +960,17 @@ async function attemptFireTask(
     // caught up, without any new alert/polling path that could race other
     // running tasks. Read-only w.r.t. everything else in this function.
     if (lateCatchUpMs != null) {
-      appendTaskRun(task.name, agentName, 'fired_late')
       logger.warn(
         { task: task.name, agent: agentName, session, lateCatchUpMinutes: Math.round(lateCatchUpMs / 60000) },
         'Scheduled task fired via restart catch-up window -- missed its normal tick',
       )
-    } else {
-      appendTaskRun(task.name, agentName, 'fired')
     }
+    appendTaskRun(task.name, agentName, firedStatus)
+    // Use the exact injection timestamp everywhere: the lost-injection
+    // watchdog must be able to prove it is rolling back this fire rather than
+    // a newer one that happened to use the same task name.
+    scheduleLastRun.set(task.name, injectedAt)
+    persistScheduleLastRun()
     logger.info({ task: task.name, agent: agentName, session }, 'Scheduled task fired')
 
     // Register the injection in the post-fire timeout watchdog. The watchdog
@@ -864,17 +979,34 @@ async function attemptFireTask(
     // previous entry (task re-fired before the prior one completed -- e.g. a
     // manual "run now" overlapping a cron tick; track the latest injection
     // because the agent is processing that one).
+    //
+    // injectedAt is a FRESH Date.now() here, not the tick-start `now` used
+    // above for scheduleLastRun/appendTaskRun. `now` is captured once at the
+    // top of runCheck(), before isSessionReadyForPrompt's wait and before
+    // sendPromptToSession's own pre-flight wait-until-idle (up to 12s) +
+    // chunked send + internal submit-retry loop all ran -- all of that is
+    // real wall-clock time that had already elapsed by the time we get here,
+    // but using stale `now` as injectedAt silently charged it against
+    // TASK_FIRE_GRACE_MS before the prompt had even landed in the pane
+    // (2026-09-07: ledger-live-drain, a fast 2-minute heartbeat sharing the
+    // busy jarvis-channels session, was measured losing 2-12s this way on
+    // every fire -- see grace-window comment above). The detached post-send
+    // resubmit chain a few lines below (started via setTimeout, for a
+    // swallowed Enter) runs AFTER this point and is unaffected by which `now`
+    // we pick, but stamping injectedAt fresh at least gives the full grace
+    // budget to everything that happens from here on.
     taskInflightMap.set(`${task.name}@${agentName}`, {
       taskName: task.name,
       agentName,
       session,
       host,
-      injectedAt: now,
+      injectedAt,
       alerted: false,
       sawTurn: false,
-      workingDir: agentName === MAIN_AGENT_ID ? PROJECT_ROOT : agentDir(agentName),
-      configDir: agentName === MAIN_AGENT_ID ? undefined : (readAgentClaudeConfigDir(agentName) ?? undefined),
-      timeoutMs: resolveStuckTimeoutMs(task),
+      workingDir,
+      configDir,
+      timeoutMs,
+      expectedOutput,
     })
 
     // Post-send verify: if the agent started a new turn during our chunk
@@ -1038,9 +1170,10 @@ export async function runScheduledTaskNow(
     // busy session both get a queued retry that lands once the session is
     // ready. We deliberately do NOT consult skipIfBusy here -- that flag trims
     // redundant cron ticks, but an explicit run-now must not be dropped.
-    if (result === 'starting' || result === 'busy' || result === 'mcp-missing' || result === 'first-run') {
+    if (result === 'starting' || result === 'busy' || result === 'missing' || result === 'error' || result === 'mcp-missing' || result === 'first-run') {
       const reason = result === 'mcp-missing' ? mcpMissingReason(task.name, agentName) : result
       insertPendingTaskRetryIfNew(task.name, agentName, now, reason)
+      if (result === 'missing') appendTaskRun(task.name, agentName, 'missing-retrying')
     }
     summary.push(`${agentName}: ${result}`)
   }
@@ -1240,6 +1373,9 @@ export function startScheduleRunner(): NodeJS.Timeout {
   // Reload the persisted last-run times so a restart inside a task's catch-up
   // window does not re-fire an already-run task.
   loadScheduleLastRun()
+  // scheduleLastRun prevents duplicate cron delivery; it is not completion
+  // evidence. Restore independent freshness checks before watchdog/retries.
+  recoverTaskOutputObligations()
 
   // Surface the effective cron timezone at startup. A silent UTC fallback (no
   // SCHEDULER_TZ/TZ in the env) shifts every fixed-time cron off its intended
@@ -1344,6 +1480,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
         maxTrackMs: TASK_FIRE_MAX_TRACK_MS,
       })
       if (decision === 'clear') {
+        settleExpectedOutput(entry, now)
         taskInflightMap.delete(key)
       } else if (decision === 'alert') {
         sendTaskTimeoutAlert(entry, now - entry.injectedAt)
@@ -1365,6 +1502,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
           persistScheduleLastRun()
         }
         insertPendingTaskRetryIfNew(entry.taskName, entry.agentName, now, 'lost-injection')
+        if (entry.expectedOutput) deleteTaskOutputObligation(entry.taskName, entry.agentName, entry.injectedAt)
         taskInflightMap.delete(key)
       }
     }
@@ -1572,6 +1710,13 @@ export function startScheduleRunner(): NodeJS.Timeout {
           // here we deliberately woke the agent for its scheduled run). The
           // pending-retry loop then sends as soon as Claude has booted.
           insertPendingTaskRetryIfNew(task.name, agentName, now, 'starting')
+        } else if (result === 'missing') {
+          // A failed auto-start is transient infrastructure state, not grounds
+          // to abandon a due task. Persist both the retry and a run-history
+          // transition so a vanished jarvis-channels session is diagnosable
+          // even if the runner restarts before the next retry tick.
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'missing')
+          appendTaskRun(task.name, agentName, 'missing-retrying')
         } else if (result === 'busy') {
           // A forceSend task only ever reports 'busy' from the context-
           // saturation deferral inside attemptFireTask -- every other busy
@@ -1607,6 +1752,8 @@ export function startScheduleRunner(): NodeJS.Timeout {
           // trace. The retry row keeps it alive and the aged alert names the
           // actual blocker instead of a generic "busy".
           insertPendingTaskRetryIfNew(task.name, agentName, now, 'first-run')
+        } else if (result === 'error') {
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'error')
         }
       }
     }

@@ -175,6 +175,31 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     secret: false,
     requiresRestart: false,
   },
+  // --- Kanban execution lanes / §23-24 One Piece Flow (TASK-0018, review
+  // blocker #7 -- registry/docs coverage for the two new lane-WIP keys).
+  // Restart required: db.ts atomically snapshots policy into SQLite at init.
+  // Unlike other Kanban settings, pending file overrides must not disagree
+  // with persistent triggers used by independent database connections.
+  {
+    key: 'KANBAN_LANE_WIP_LIMIT',
+    type: 'int',
+    default: 1,
+    min: 0,
+    max: 100,
+    description: 'Hány kártya lehet egyszerre "in_progress" állapotban ugyanabban a sávban (lane). 0 = korlátlan. Sávonként felülírható a KANBAN_LANE_WIP_LIMIT_<LANE> (pl. KANBAN_LANE_WIP_LIMIT_EMAIL) env-kulccsal, ami itt a registryben nem jelenik meg külön. Újraindítás szükséges.',
+    module: 'kanban',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    key: 'KANBAN_LANE_WIP_ENFORCE',
+    type: 'boolean',
+    default: '0',
+    description: 'Ha be van kapcsolva, a sávonkénti WIP-limitet túllépő mozgatás elutasításra kerül (409). Kikapcsolva (canary, alapértelmezett) a mozgatás átmegy, csak wip_warning kerül a válaszba és a logba. Újraindítás szükséges.',
+    module: 'kanban',
+    secret: false,
+    requiresRestart: true,
+  },
   // --- Kanban aging thresholds and colours (hot-reload via settings-store) ---
   {
     key: 'KANBAN_AGING_WARN_H',
@@ -271,6 +296,15 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     type: 'string',
     default: 'http://localhost:11434',
     description: 'Az Ollama API alap-URL-je. Memória-embedding és modell-javaslat ezt használja.',
+    module: 'system',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    key: 'CONTEXT_GATE_CANARY_ENABLED',
+    type: 'boolean',
+    default: '0',
+    description: 'Engedélyezi a kizárólag explicit POST kéréssel futó, fix bemenetű Context Gate canary végpontot. Alapértelmezésben kikapcsolva.',
     module: 'system',
     secret: false,
     requiresRestart: true,

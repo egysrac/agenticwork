@@ -1,10 +1,12 @@
-import { recallByDateRange, recallSearch, getDailyLogDates } from '../../db.js'
-import { MAIN_AGENT_ID, APP_TZ } from '../../config.js'
+import { recallByDateRange, recallSearch, getDailyLogDates, getDb } from '../../db.js'
+import { MAIN_AGENT_ID, APP_TZ, CONTEXT_GATE_CANARY_ENABLED } from '../../config.js'
 import { json } from '../http-helpers.js'
 import { gateContext, assembleContext } from '../../context-gate.js'
 import type { RelevanceChunk } from '../../qwen-router.js'
 import { logger } from '../../logger.js'
 import type { RouteContext } from './types.js'
+import { contextGateCanaryRouteDecision, runContextGateCanary } from '../../context-gate-canary.js'
+import { appendTaskObservation } from '../../task-observability.js'
 
 const TZ = APP_TZ  // install zone (config.APP_TZ); was hardcoded Europe/Budapest
 
@@ -184,7 +186,20 @@ function escapeLike(s: string): string {
 }
 
 export async function tryHandleRecall(ctx: RouteContext): Promise<boolean> {
-  const { res, path, method, url } = ctx
+  const { req, res, path, method, url } = ctx
+  // Caller headers are assertions, not authenticated provenance. Keep recall
+  // observations server-generated and deliberately non-correlatable.
+  const observation = { correlationId: undefined, sessionId: null, taskId: null }
+
+  const canaryDecision = contextGateCanaryRouteDecision(path, method, CONTEXT_GATE_CANARY_ENABLED)
+  if (canaryDecision !== 'not_canary') {
+    if (canaryDecision === 'disabled') {
+      json(res, { error: 'context_gate_canary_disabled' }, 404)
+      return true
+    }
+    json(res, await runContextGateCanary(undefined, { db: getDb(), correlationId: observation.correlationId, sessionId: observation.sessionId }))
+    return true
+  }
 
   if (path === '/api/recall' && method === 'GET') {
     const dateExpr = url.searchParams.get('date') || ''
@@ -200,7 +215,7 @@ export async function tryHandleRecall(ctx: RouteContext): Promise<boolean> {
 
     if (query && !dateExpr) {
       const result = recallSearch(query, agent, limit)
-      const formatted = await maybeGateMemories(result, query, { enabled: gate, topK: gateTopK })
+      const formatted = await maybeGateMemories(result, query, { enabled: gate, topK: gateTopK }, observation)
       json(res, formatted)
       return true
     }
@@ -220,7 +235,7 @@ export async function tryHandleRecall(ctx: RouteContext): Promise<boolean> {
       result.memories = result.memories.filter(m => m.content.toLowerCase().includes(qLower) || (m.keywords || '').toLowerCase().includes(qLower))
     }
 
-    const formatted = await maybeGateMemories(result, query, { enabled: gate, topK: gateTopK })
+    const formatted = await maybeGateMemories(result, query, { enabled: gate, topK: gateTopK }, observation)
     json(res, formatted)
     return true
   }
@@ -267,11 +282,33 @@ async function maybeGateMemories(
   result: { logs: any[]; memories: any[]; dateRange: { from: string; to: string } },
   query: string,
   opts: { enabled: boolean; topK: number },
+  observation?: { correlationId?: string; sessionId: string | null; taskId: string | null },
 ): Promise<ReturnType<typeof formatRecallResult>> {
   if (!opts.enabled) return formatRecallResult(result)
-  if (!query.trim()) return formatRecallResult(result)
+  const observe = (outcome: string, before: number, after: number, returnedUnfiltered: boolean) => {
+    if (!observation) return
+    try {
+      appendTaskObservation(getDb(), {
+        correlationId: observation.correlationId, kind: 'context_gate_measurement',
+        taskId: observation.taskId, sessionId: observation.sessionId,
+        provenance: 'TASK-0016.recall.context_gate.v1',
+        metadata: { source: 'recall', outcome, candidate_count: before,
+          returned_count: after, top_k: opts.topK, returned_unfiltered: returnedUnfiltered,
+          query_present: Boolean(query.trim()), gate_enabled: true },
+      })
+    } catch (err) {
+      logger.warn({ err }, 'recall: observation persistence failed')
+    }
+  }
+  if (!query.trim()) {
+    observe('skipped_no_query', result.memories.length, result.memories.length, true)
+    return formatRecallResult(result)
+  }
   const before = result.memories.length
-  if (before <= opts.topK) return formatRecallResult(result, { enabled: true, before, after: before, topK: opts.topK })
+  if (before <= opts.topK) {
+    observe('skipped_bounded_input', before, before, true)
+    return formatRecallResult(result, { enabled: true, before, after: before, topK: opts.topK })
+  }
 
   const candidates: RelevanceChunk[] = result.memories.map(m => ({
     id: String(m.id),
@@ -287,16 +324,20 @@ async function maybeGateMemories(
     })
   } catch (err) {
     logger.warn({ err, query: query.slice(0, 80) }, 'recall: context gate failed, returning unfiltered memories')
+    observe('fail_open_error', before, before, true)
     return formatRecallResult(result, { enabled: true, before, after: before, topK: opts.topK })
   }
 
   if (gateResult.length === 0) {
+    observe('fail_open_empty', before, before, true)
     return formatRecallResult(result, { enabled: true, before, after: before, topK: opts.topK })
   }
 
   const idsKept = new Set(gateResult.map(r => r.id))
   const filteredMemories = result.memories.filter(m => idsKept.has(String(m.id)))
   const after = filteredMemories.length
+
+  observe('filtered', before, after, false)
 
   logger.info(
     { query: query.slice(0, 80), before, after, topK: opts.topK },

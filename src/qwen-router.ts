@@ -23,6 +23,14 @@
 
 import { OLLAMA_URL } from './config.js'
 import { logger } from './logger.js'
+import {
+  getRelevanceFilterCallCount,
+  getRelevanceFilterMetrics,
+  recordRelevanceFilterCall,
+  reloadRelevanceFilterMetricsForTest,
+} from './metrics/relevance-filter-metrics.js'
+
+export { getRelevanceFilterCallCount, getRelevanceFilterMetrics, reloadRelevanceFilterMetricsForTest }
 
 export type RoutingCost = 'low' | 'medium' | 'high'
 export type RoutingPriority = 'low' | 'normal' | 'high' | 'critical'
@@ -37,6 +45,8 @@ export interface CompleteOptions {
   /** Max tokens to generate. Defaults differ by provider. */
   maxTokens?: number
   temperature?: number
+  /** Do not fall back to Anthropic when the local Ollama call fails. */
+  localOnly?: boolean
 }
 
 export interface CompleteResult {
@@ -131,7 +141,8 @@ export async function complete(prompt: string, opts: CompleteOptions = {}): Prom
       const text = await ollamaCaller(prompt, opts, model, QWEN_TIMEOUT_MS)
       return { text, provider: 'qwen', elapsedMs: Date.now() - start, fallback: false }
     } catch (err) {
-      logger.warn({ err, model }, 'qwen-router: ollama call failed, falling back to anthropic')
+      logger.warn({ err, model, localOnly: opts.localOnly === true }, 'qwen-router: ollama call failed')
+      if (opts.localOnly) throw err
     }
   }
 
@@ -160,13 +171,21 @@ export async function classify(
   labels: readonly string[],
   opts: CompleteOptions = {},
 ): Promise<string> {
+  return (await classifyWithCompletion(text, labels, opts)).label
+}
+
+async function classifyWithCompletion(
+  text: string,
+  labels: readonly string[],
+  opts: CompleteOptions,
+): Promise<{ label: string; completion: CompleteResult }> {
   const list = labels.map((l, i) => `${i + 1}. ${l}`).join('\n')
   const prompt = `Kategorizáld az alábbi szöveget a megadott címkék egyikébe. Csak a számot add vissza (1-${labels.length}), semmi mást.\n\nCímkék:\n${list}\n\nSzöveg:\n${text.slice(0, 2000)}\n\nVálasz:`
-  const result = await complete(prompt, { ...opts, maxTokens: 4, temperature: 0 })
-  const m = result.text.trim().match(/^(\d+)/)
-  if (!m) return labels[0]
+  const completion = await complete(prompt, { ...opts, maxTokens: 4, temperature: 0 })
+  const m = completion.text.trim().match(/^(\d+)/)
+  if (!m) return { label: labels[0], completion }
   const idx = parseInt(m[1], 10) - 1
-  return labels[idx] ?? labels[0]
+  return { label: labels[idx] ?? labels[0], completion }
 }
 
 // =============================================================================
@@ -213,6 +232,10 @@ export interface RelevanceResult {
 export interface RelevanceFilterOptions extends CompleteOptions {
   /** Maximum number of chunks to return. Defaults to 5. */
   topK?: number
+  /** Disable the N-call per-chunk retry; intended for bounded probes. */
+  perChunkFallback?: boolean
+  /** Reports the provider only after a complete, valid batch was accepted. */
+  onBatchProvider?: (provider: CompleteResult['provider']) => void
 }
 
 const DEFAULT_RELEVANCE_TOP_K = 5
@@ -243,8 +266,30 @@ export async function relevanceFilter(
   chunks: readonly RelevanceChunk[],
   opts: RelevanceFilterOptions = {},
 ): Promise<RelevanceResult[]> {
+  let outcome: RelevanceFilterOutcome | undefined
+  try {
+    outcome = await runRelevanceFilter(query, chunks, opts)
+    return outcome.results
+  } finally {
+    recordRelevanceFilterCall(outcome?.failed ?? chunks.length > 0)
+  }
+}
+
+interface RelevanceFilterOutcome {
+  results: RelevanceResult[]
+  /** The filter requested local Qwen but obtained no usable result from it. */
+  failed: boolean
+}
+
+async function runRelevanceFilter(
+  query: string,
+  chunks: readonly RelevanceChunk[],
+  opts: RelevanceFilterOptions,
+): Promise<RelevanceFilterOutcome> {
   const topK = opts.topK ?? DEFAULT_RELEVANCE_TOP_K
-  if (chunks.length === 0) return []
+  if (chunks.length === 0) return { results: [], failed: false }
+  let qwenAttempted = false
+  let qwenSucceeded = false
 
   // ---- Batch path (1 round-trip) ----
   const batchPrompt = buildRelevanceBatchPrompt(query, chunks, topK)
@@ -256,37 +301,56 @@ export async function relevanceFilter(
     })
     const parsed = parseRelevanceBatchResponse(batchResult.text, chunks, topK)
     if (parsed.length >= Math.min(topK, chunks.length)) {
-      return parsed.slice(0, topK)
+      opts.onBatchProvider?.(batchResult.provider)
+      qwenAttempted = batchResult.provider === 'qwen' || batchResult.fallback
+      qwenSucceeded = batchResult.provider === 'qwen'
+      return { results: parsed.slice(0, topK), failed: qwenAttempted && !qwenSucceeded }
     }
+    qwenAttempted = batchResult.provider === 'qwen' || batchResult.fallback
     logger.warn(
       { batchLength: parsed.length, wanted: Math.min(topK, chunks.length) },
       'qwen-router: relevance batch returned fewer items than asked, falling back to per-chunk',
     )
   } catch (err) {
+    qwenAttempted = preferQwen(opts)
     logger.warn(
       { err, chunkCount: chunks.length },
       'qwen-router: relevance batch path failed, falling back to per-chunk',
     )
   }
 
-  // ---- Per-chunk fallback (N round-trips) ----
+  if (opts.perChunkFallback === false) {
+    return { results: [], failed: qwenAttempted && !qwenSucceeded }
+  }
+
+  // Keep an explicit Anthropic-only caller policy intact. The historical
+  // low-cost fallback is appropriate only when the caller did not demand the
+  // strong/cloud route; otherwise a malformed batch must not secretly probe
+  // Qwen or attribute a Qwen failure.
+  const perChunkOpts = opts.cost === 'high' ? opts : { ...opts, cost: 'low' as const }
   const scored: RelevanceResult[] = []
   for (const chunk of chunks) {
     let score = 0.0
     try {
-      const label = await classify(
+      const classified = await classifyWithCompletion(
         `Query: ${query.slice(0, RELEVANCE_FALLBACK_CONTENT_CHARS)}\n\nChunk ${chunk.id}: ${chunk.content.slice(0, RELEVANCE_FALLBACK_CONTENT_CHARS)}`,
         ['releváns', 'nem releváns'],
-        { ...opts, cost: 'low' },
+        perChunkOpts,
       )
-      score = label === 'releváns' ? 0.5 : 0.0
+      qwenAttempted = qwenAttempted || classified.completion.provider === 'qwen' || classified.completion.fallback
+      qwenSucceeded = qwenSucceeded || classified.completion.provider === 'qwen'
+      score = classified.label === 'releváns' ? 0.5 : 0.0
     } catch (err) {
+      qwenAttempted = qwenAttempted || preferQwen(perChunkOpts)
       logger.warn({ err, chunkId: chunk.id }, 'qwen-router: per-chunk classify failed, score=0')
       score = 0.0
     }
     scored.push({ id: chunk.id, score })
   }
-  return scored.sort((a, b) => b.score - a.score).slice(0, topK)
+  return {
+    results: scored.sort((a, b) => b.score - a.score).slice(0, topK),
+    failed: qwenAttempted && !qwenSucceeded,
+  }
 }
 
 function buildRelevanceBatchPrompt(query: string, chunks: readonly RelevanceChunk[], topK: number): string {

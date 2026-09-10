@@ -7,6 +7,7 @@
 // by calling importFleet with a pre-encrypted payload and mocked DB / FS module.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { _encryptForTest, _decryptForTest, ENCRYPTED_FLEET_VERSION, MIN_VAULT_PASSWORD_LEN } from '../web/fleet-transfer.js'
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,14 @@ describe('encrypt/decrypt round-trip', () => {
   })
 })
 
+describe('kanban lane transfer contract', () => {
+  it('exports every card field and imports through the legacy-safe lane-preserving writer', () => {
+    const source = readFileSync(new URL('../web/fleet-transfer.ts', import.meta.url), 'utf8')
+    expect(source).toContain("cards: db.prepare('SELECT * FROM kanban_cards').all()")
+    expect(source).toContain('insertImportedKanbanCard(c)')
+  })
+})
+
 // ---------------------------------------------------------------------------
 // importFleet: encrypted wrapper detection (with mocked FS / DB)
 // ---------------------------------------------------------------------------
@@ -58,6 +67,7 @@ vi.mock('../db.js', () => ({
   }),
   backfillEmbeddings: () => Promise.resolve(),
   initDatabase: () => {},
+  insertImportedKanbanCard: () => {},
 }))
 
 vi.mock('../web/agent-config.js', () => ({

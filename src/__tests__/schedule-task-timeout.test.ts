@@ -144,6 +144,61 @@ describe('decideTaskTimeout: injection that never started a turn', () => {
   })
 })
 
+// --- LEDGERLIVE907: grace window must survive the swallowed-Enter recovery
+// chain on a busy shared session ---
+//
+// 2026-09-07: ledger-live-drain (a */2 * * * * heartbeat sharing the busy
+// jarvis-channels session with other scheduled tasks) was flipping between
+// 'fired' and 'lost' roughly every 30s instead of its real 2-minute cadence.
+// Two live measurements from the production task_runs log / dashboard.log:
+//   - a 'lost' fired at elapsedMs:30002 -- the pane had gone idle and sawTurn
+//     was still false at almost exactly the OLD 30_000ms grace boundary.
+//   - a follow-up retry's prompt was observed landing in the session
+//     transcript 28.6s after its own "Scheduled task fired" log line -- 1.3s
+//     under the old grace, so even retries kept re-tripping the same wire.
+// The post-send resubmit chain (setTimeout(resubmit, 2000), then up to
+// RESUBMIT_MAX_ATTEMPTS more attempts 3s apart) exists precisely to recover a
+// swallowed Enter, but its worst case (~17s) plus the agent's own turn time
+// (10-30s observed for a trivial heartbeat once picked up) routinely exceeded
+// 30s end to end. This block pins the grace window at a value that comfortably
+// covers that combined worst case, so a fix that quietly shrinks it back down
+// regresses the exact bug this suite exists to catch.
+describe('decideTaskTimeout: LEDGERLIVE907 -- grace window covers the resubmit chain', () => {
+  it('holds (does not report lost) at 28.6s elapsed -- the measured production near-miss', () => {
+    const entry = makeEntry({ injectedAt: 0, sawTurn: false })
+    const now = 28_667
+    expect(decideTaskTimeout(entry, 'idle', now, BASE_OPTS)).toBe('hold')
+  })
+
+  it('holds at the old 30s boundary that used to report lost', () => {
+    const entry = makeEntry({ injectedAt: 0, sawTurn: false })
+    const now = 30_002
+    expect(decideTaskTimeout(entry, 'idle', now, BASE_OPTS)).toBe('hold')
+  })
+
+  it('the grace constant itself is at least 60s (fix-revert guard)', () => {
+    // A future edit that quietly lowers TASK_FIRE_GRACE_MS back toward 30s
+    // would pass every other test in this file (they all parametrise off the
+    // imported constant) while silently reintroducing the LEDGERLIVE907 loop.
+    // Pin the floor explicitly.
+    expect(GRACE).toBeGreaterThanOrEqual(60_000)
+  })
+
+  it('injectedAt is stamped fresh at registration time, not reused from the tick-start clock (fix-revert guard)', () => {
+    // The stale-timestamp half of the fix: entry.injectedAt used to be the
+    // `now` captured once at the top of runCheck(), before
+    // isSessionReadyForPrompt's wait and sendPromptToSession's own pre-flight
+    // wait-until-idle (up to 12s) + chunked send had run -- silently charging
+    // that elapsed time against the grace window before the prompt had even
+    // landed. It must be a fresh Date.now() taken right when the in-flight
+    // entry is registered.
+    const src = readFileSync(join(__dirname, '../web/schedule-runner.ts'), 'utf-8')
+    expect(src).toMatch(/const injectedAt = Date\.now\(\)/)
+    expect(src).toMatch(/scheduleLastRun\.set\(task\.name, injectedAt\)/)
+    expect(src).toMatch(/scheduleLastRun\.get\(entry\.taskName\) === entry\.injectedAt/)
+  })
+})
+
 // --- Non-busy pane states ---
 
 describe('decideTaskTimeout: non-busy pane states hold (owned by other watchdogs)', () => {
@@ -258,6 +313,6 @@ describe('resolveStuckTimeoutMs: the threshold is per task', () => {
   it('the sweep uses the entry budget, not the global constant (fix-revert guard)', () => {
     const src = readFileSync(join(__dirname, '../web/schedule-runner.ts'), 'utf-8')
     expect(src).toMatch(/timeoutMs: entry\.timeoutMs,/)
-    expect(src).toMatch(/timeoutMs: resolveStuckTimeoutMs\(task\),/)
+    expect(src).toMatch(/const timeoutMs = resolveStuckTimeoutMs\(task\)/)
   })
 })

@@ -17,6 +17,9 @@ import type { ScheduledTask } from '../web/scheduled-tasks-io.js'
 //   * result 'fired' still deletes the row (the queue drains normally).
 
 const mockAppendTaskRun = vi.fn()
+const mockPersistOutputObligation = vi.fn()
+const mockDeleteOutputObligation = vi.fn()
+const mockInsertPendingRetry = vi.fn()
 const mockDeletePendingRetry = vi.fn()
 // Mirrors the real DB: refreshing the row updates its last_reason, so the
 // NEXT tick sees the state this tick wrote (the transition-dedup depends on
@@ -45,10 +48,13 @@ vi.mock('../web/atomic-write.js', () => ({
 
 vi.mock('../db.js', () => ({
   appendTaskRun: (...a: unknown[]) => mockAppendTaskRun(...a),
+  persistTaskOutputObligation: (...a: unknown[]) => mockPersistOutputObligation(...a),
+  listTaskOutputObligations: vi.fn(() => []),
+  deleteTaskOutputObligation: (...a: unknown[]) => mockDeleteOutputObligation(...a),
   listPendingTaskRetries: () => mockListPendingRetries(),
   deletePendingTaskRetry: (...a: unknown[]) => mockDeletePendingRetry(...a),
   updatePendingTaskRetry: mockUpdatePendingRetry,
-  insertPendingTaskRetryIfNew: vi.fn(),
+  insertPendingTaskRetryIfNew: mockInsertPendingRetry,
   markPendingTaskRetryAlert: vi.fn(() => false),
   clearPendingTaskRetryAlert: vi.fn(),
   markScheduledTaskKanbanWaiting: vi.fn(),
@@ -172,5 +178,70 @@ describe('schedule runner: pending retry survives a missing target session', () 
     await runOneTick()
 
     expect(mockDeletePendingRetry).toHaveBeenCalledWith(DAILY.name, 'retryagent')
+  })
+
+  it('manual preflight persists a retry and failure evidence when the target cannot start', async () => {
+    const { runScheduledTaskNow } = await loadRunner()
+    const result = await runScheduledTaskNow(DAILY.name)
+
+    expect(result).toEqual({ ok: true, result: 'retryagent: missing' })
+    const db = await import('../db.js')
+    expect(db.insertPendingTaskRetryIfNew).toHaveBeenCalledWith(
+      DAILY.name,
+      'retryagent',
+      expect.any(Number),
+      'missing',
+    )
+    expect(mockAppendTaskRun).toHaveBeenCalledWith(DAILY.name, 'retryagent', 'missing-retrying')
+  })
+
+  it.each([
+    ['reggeli-napindito', 'MORNING.md'],
+    ['dream-engine', 'DREAM.md'],
+  ])('RED/GREEN: %s file preparation receives no direct-delivery prefix', async (name, output) => {
+    mockSessionExists.mockReturnValue(true)
+    mockListScheduledTasks.mockReturnValue([task({
+      name,
+      schedule: '30 7 * * *',
+      agent: 'retryagent',
+      expectedOutputFile: output,
+      type: name === 'dream-engine' ? 'dream-engine' : 'task',
+    })])
+    const { runScheduledTaskNow } = await loadRunner()
+    await runScheduledTaskNow(name)
+
+    const firstCall = mockSendPrompt.mock.calls.at(-1) as unknown as [unknown, string] | undefined
+    const prompt = String(firstCall?.[1] ?? '')
+    expect(prompt).toContain(output)
+    expect(prompt).toContain('Telegram uzenetet ne kuldj')
+    expect(prompt).not.toContain('api.telegram.org')
+    expect(prompt).not.toContain('reply tool')
+    expect(prompt).not.toContain('Az eredmenyt kuldd el Telegramon')
+  })
+
+  it('RED/GREEN crash window: persists obligation before injection and cleans it on injection failure', async () => {
+    mockSessionExists.mockReturnValue(true)
+    mockListScheduledTasks.mockReturnValue([task({
+      name: 'reggeli-napindito', schedule: '30 7 * * *', agent: 'retryagent',
+      expectedOutputFile: 'MORNING.md',
+    })])
+    mockSendPrompt.mockImplementationOnce(() => {
+      // This is the former crash window: prompt delivery has begun, so the
+      // durable write must already have completed.
+      expect(mockPersistOutputObligation).toHaveBeenCalledTimes(1)
+      throw new Error('synthetic injection failure')
+    })
+
+    const { runScheduledTaskNow } = await loadRunner()
+    const result = await runScheduledTaskNow('reggeli-napindito')
+
+    expect(result).toEqual({ ok: true, result: 'retryagent: error' })
+    const obligation = mockPersistOutputObligation.mock.calls[0]?.[0] as { injectedAt: number }
+    expect(mockDeleteOutputObligation).toHaveBeenCalledWith(
+      'reggeli-napindito', 'retryagent', obligation.injectedAt,
+    )
+    expect(mockInsertPendingRetry).toHaveBeenCalledWith(
+      'reggeli-napindito', 'retryagent', expect.any(Number), 'error',
+    )
   })
 })

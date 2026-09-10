@@ -326,38 +326,34 @@
       </div>
 
       <div class="kanban-board" id="kanbanBoard">
-        <div class="kanban-col" data-status="planned">
+        <div class="kanban-col" data-status="new">
           <div class="kanban-col-header">
-            <span class="kanban-col-title">Tervezett</span>
-            <span class="kanban-col-count" id="countPlanned">0</span>
-            <button class="kanban-add-btn" data-status="planned" title="Új kártya">+</button>
+            <span class="kanban-col-title">Új</span><span class="kanban-col-count" id="countNew">0</span>
+            <button class="kanban-add-btn" data-status="new" title="Új kártya">+</button>
           </div>
-          <div class="kanban-col-body" data-status="planned"></div>
+          <div class="kanban-col-body" data-status="new"></div>
         </div>
-        <div class="kanban-col" data-status="in_progress">
+        <div class="kanban-col" data-status="ready">
           <div class="kanban-col-header">
-            <span class="kanban-col-title">Folyamatban</span>
-            <span class="kanban-col-count" id="countInProgress">0</span>
-            <button class="kanban-add-btn" data-status="in_progress" title="Új kártya">+</button>
+            <span class="kanban-col-title">Kész indulni</span><span class="kanban-col-count" id="countReady">0</span>
+            <button class="kanban-add-btn" data-status="ready" title="Új kártya">+</button>
           </div>
-          <div class="kanban-col-body" data-status="in_progress"></div>
+          <div class="kanban-col-body" data-status="ready"></div>
         </div>
-        <div class="kanban-col" data-status="waiting">
+        <div class="kanban-col" data-status="running">
           <div class="kanban-col-header">
-            <span class="kanban-col-title">Várakozik</span>
-            <span class="kanban-col-count" id="countWaiting">0</span>
-            <button class="kanban-add-btn" data-status="waiting" title="Új kártya">+</button>
+            <span class="kanban-col-title">Fut</span><span class="kanban-col-count" id="countRunning">0</span>
           </div>
-          <div class="kanban-col-body" data-status="waiting"></div>
+          <div class="kanban-col-body" data-status="running"></div>
         </div>
-        <div class="kanban-col" data-status="testing">
+        <div class="kanban-col" data-status="verify">
           <div class="kanban-col-header">
-            <span class="kanban-col-title">Tesztelés</span>
-            <span class="kanban-col-count" id="countTesting">0</span>
-            <button class="kanban-add-btn" data-status="testing" title="Új kártya">+</button>
+            <span class="kanban-col-title">Ellenőrzés</span><span class="kanban-col-count" id="countVerify">0</span>
           </div>
-          <div class="kanban-col-body" data-status="testing"></div>
+          <div class="kanban-col-body" data-status="verify"></div>
         </div>
+        <div class="kanban-col" data-status="repair"><div class="kanban-col-header"><span class="kanban-col-title">Javítás</span><span class="kanban-col-count" id="countRepair">0</span></div><div class="kanban-col-body" data-status="repair"></div></div>
+        <div class="kanban-col" data-status="blocked"><div class="kanban-col-header"><span class="kanban-col-title">Blokkolt</span><span class="kanban-col-count" id="countBlocked">0</span></div><div class="kanban-col-body" data-status="blocked"></div></div>
         <div class="kanban-col" data-status="done">
           <div class="kanban-col-header">
             <span class="kanban-col-title">Kész</span>
@@ -2033,6 +2029,18 @@
               <option value="normal" selected data-i18n="kanban.priority.normal">Normál</option>
               <option value="high" data-i18n="kanban.priority.high">Magas</option>
               <option value="urgent" data-i18n="kanban.priority.urgent">Sürgős</option>
+            </select>
+          </div>
+          <div class="form-group form-half">
+            <label for="cardLane">Execution lane</label>
+            <select id="cardLane">
+              <option value="">-- JIT választás indításkor --</option>
+              <option value="DEVELOPMENT">DEVELOPMENT</option>
+              <option value="EMAIL">EMAIL</option>
+              <option value="CALENDAR">CALENDAR</option>
+              <option value="MONITORING">MONITORING</option>
+              <option value="MAINTENANCE">MAINTENANCE</option>
+              <option value="ADMIN">ADMIN</option>
             </select>
           </div>
         </div>

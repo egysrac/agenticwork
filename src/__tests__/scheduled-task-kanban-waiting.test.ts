@@ -2,7 +2,10 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import {
   initDatabase,
   createKanbanCard,
+  moveKanbanCardWithLaneGate,
+  transitionKanbanWorkflowState,
   getKanbanCard,
+  getKanbanCardEvents,
   findActiveKanbanCardByTitle,
   markScheduledTaskKanbanWaiting,
   archiveKanbanCard,
@@ -20,6 +23,14 @@ import {
 beforeEach(() => {
   initDatabase(':memory:')
 })
+
+function createRunningCard(id: string, title: string): void {
+  createKanbanCard({ id, title })
+  const result = moveKanbanCardWithLaneGate(
+    id, 'in_progress', 0, 'scheduler-test', 'MONITORING', { limit: 1, enforce: true },
+  )
+  expect(result.changed).toBe(true)
+}
 
 describe('findActiveKanbanCardByTitle', () => {
   it('finds an active card by exact title match', () => {
@@ -50,13 +61,13 @@ describe('findActiveKanbanCardByTitle', () => {
 
 describe('markScheduledTaskKanbanWaiting', () => {
   it('moves the matching active card to waiting and returns its id', () => {
-    createKanbanCard({ id: 'card-1', title: 'daily-digest', status: 'in_progress' })
+    createRunningCard('card-1', 'daily-digest')
 
     const result = markScheduledTaskKanbanWaiting('daily-digest')
 
     expect(result).toBe('card-1')
     const card = getKanbanCard('card-1')
-    expect(card!.status).toBe('waiting')
+    expect(card).toMatchObject({ status: 'waiting', state: 'blocked' })
   })
 
   it('returns null and makes no changes when no card matches', () => {
@@ -82,7 +93,7 @@ describe('markScheduledTaskKanbanWaiting', () => {
   })
 
   it('is a no-op for archived cards (does not revive them)', () => {
-    createKanbanCard({ id: 'card-1', title: 'daily-digest', status: 'done' })
+    createKanbanCard({ id: 'card-1', title: 'daily-digest' })
     archiveKanbanCard('card-1')
 
     const result = markScheduledTaskKanbanWaiting('daily-digest')
@@ -91,17 +102,19 @@ describe('markScheduledTaskKanbanWaiting', () => {
   })
 
   it('records a status-transition event for auditing', () => {
-    createKanbanCard({ id: 'card-1', title: 'daily-digest', status: 'in_progress' })
+    createRunningCard('card-1', 'daily-digest')
     markScheduledTaskKanbanWaiting('daily-digest')
 
     // Verify the card status changed (the audit event is written inside
     // moveKanbanCard; the functional signal is the status itself).
     expect(getKanbanCard('card-1')!.status).toBe('waiting')
+    expect(getKanbanCardEvents('card-1').at(-1)).toMatchObject({ to_state: 'blocked', actor: 'scheduler' })
   })
 
   it('places the card at the end of the waiting column (sort_order after existing waiting cards)', () => {
-    createKanbanCard({ id: 'wait-1', title: 'earlier-task', status: 'waiting' })
-    createKanbanCard({ id: 'card-1', title: 'daily-digest', status: 'in_progress' })
+    createKanbanCard({ id: 'wait-1', title: 'earlier-task' })
+    transitionKanbanWorkflowState('wait-1', 'blocked', 7, 'test')
+    createRunningCard('card-1', 'daily-digest')
 
     markScheduledTaskKanbanWaiting('daily-digest')
 

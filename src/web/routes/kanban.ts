@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import {
-  listKanbanCards, createKanbanCard, updateKanbanCard,
-  deleteKanbanCard, moveKanbanCard, archiveKanbanCard, unarchiveKanbanCard,
+  listKanbanCards, createKanbanCard,
+  deleteKanbanCard, archiveKanbanCard, unarchiveKanbanCardWithLaneGate,
   getKanbanComments, addKanbanComment, getKanbanCardEvents, listKanbanProjects,
   getKanbanCard, getChildCards, getDb,
   createAgentMessage, markKanbanCardDispatched,
@@ -15,17 +15,36 @@ import {
   countNewHotMemories,
   countPlannedKanbanCards,
   getDbFileSizeMb,
+  moveKanbanCardWithLaneGate,
+  updateKanbanCardWithLaneGate,
+  transitionKanbanWorkflowState,
 } from '../../db.js'
 import { normalizeKanbanRefs } from '../kanban-ref-normalize.js'
-import { OWNER_NAME, BOT_NAME, MAIN_AGENT_ID, STORE_DIR, WEB_HOST, WEB_PORT, KANBAN_LABEL_COLORS } from '../../config.js'
+import {
+  OWNER_NAME, BOT_NAME, MAIN_AGENT_ID, STORE_DIR, WEB_HOST, WEB_PORT, KANBAN_LABEL_COLORS,
+} from '../../config.js'
 import { listAgentNames, readAgentDisplayName } from '../agent-config.js'
 import { isAgentRunning } from '../agent-process.js'
 import { resolveKanbanDispatchTarget } from '../../kanban-dispatch.js'
+import { KANBAN_LANES, isValidLane } from '../../kanban-lane-wip.js'
 import { generateBreakdown } from '../llm-breakdown.js'
 import { logger } from '../../logger.js'
 import { readBody, json, jsonMaybeGzip } from '../http-helpers.js'
 import { getEffectiveSettingValue } from '../../settings-store.js'
 import type { RouteContext } from './types.js'
+import { isLegacyKanbanStatus, isWorkflowState, resolveInitialWorkflowState, resolveWorkflowTransitionState, WorkflowCreationError, workflowStateFromLegacyStatus } from '../../kanban-workflow.js'
+
+// Lane settings are a DB-initialization snapshot (requiresRestart:true).
+// Read the committed SQL policy, not pending settings-store values: independent
+// connections and HTTP writers must enforce the same limits.
+export function resolveLaneWipEnforce(): boolean {
+  return (getDb().prepare('SELECT enforce FROM kanban_lane_policy LIMIT 1').get() as { enforce: number }).enforce === 1
+}
+export function resolveLaneWipLimit(lane: string): number {
+  const row = getDb().prepare('SELECT limit_value FROM kanban_lane_policy WHERE lane=?').get(lane) as { limit_value: number } | undefined
+  if (!row) throw new Error(`Invalid execution lane: ${lane}`)
+  return row.limit_value
+}
 
 // A headless agent cannot "drag" a card to done, so the dispatch hands it the
 // exact curl commands to (1) post a short, human-readable result summary as a
@@ -51,7 +70,7 @@ export function kanbanMoveInstructions(id: string, target: string): string {
   const isMainAgent = target === MAIN_AGENT_ID
   const escalateTo = isMainAgent ? OWNER_NAME : MAIN_AGENT_ID
   return [
-    'A kártyát in_progress-re húzták. Amikor VÉGEZTÉL, két lépés (mindkettő a kártyára kerül, a web UI-ban látszik):',
+    'A kártya RUNNING állapotba került. Amikor elkészült a munka, add át VERIFY ellenőrzésre:',
     '',
     '1) Írj egy rövid eredmény-összefoglalót kommentként (1-2 mondat: mi lett a vége):',
     `  curl -s -X POST ${commentUrl} \\`,
@@ -59,11 +78,11 @@ export function kanbanMoveInstructions(id: string, target: string): string {
     `    -H 'Content-Type: application/json' \\`,
     `    -d '{"author":"${target}","content":"AZ EREDMENY ROVIDEN"}'`,
     '',
-    '2) Állítsd a kártyát done-ra:',
+    '2) Állítsd a kártyát VERIFY állapotba (DONE csak sikeres ellenőrzés után következhet):',
     `  curl -s -X POST ${moveUrl} \\`,
     `    ${auth} \\`,
     `    -H 'Content-Type: application/json' \\`,
-    `    -d '{"status":"done","actor":"${target}"}'`,
+    `    -d '{"state":"verify","actor":"${target}"}'`,
     '',
     // The "actor" field is not decoration: it is what tells the board WHO moved
     // the card. Without it a self-pickup (agent -> in_progress on its own card)
@@ -73,20 +92,20 @@ export function kanbanMoveInstructions(id: string, target: string): string {
     `  curl -s -X POST ${moveUrl} \\`,
     `    ${auth} \\`,
     `    -H 'Content-Type: application/json' \\`,
-    `    -d '{"status":"in_progress","actor":"${target}"}'`,
+    `    -d '{"state":"running","actor":"${target}"}'`,
     '',
-    `Ha elakadtál / ${escalateTo} döntésére/lépésére vársz: NE csak status="waiting"-et állíts be. HÁROM lépés kell EGYÜTT:`,
+    `Ha elakadtál / ${escalateTo} döntésére/lépésére vársz: NE csak state="blocked"-ot állíts be. HÁROM lépés kell EGYÜTT:`,
     `  a) Írj egy kommentet ami KÖZVETLENÜL ${escalateTo}-hez szól, egyértelműen megfogalmazva mit kell eldöntenie/megtennie (NE a saját belső elemzésedet írd oda) -- ugyanaz a comments hívás mint fent, "content" mezőben.`,
     `  b) Told át a kártyát ${escalateTo}-re, hogy egyértelmű legyen a felelősség (a te neved NE maradjon rajta, ha nem te vagy a blokkoló):`,
     `     curl -s -X PUT ${cardUrl} \\`,
     `       ${auth} \\`,
     `       -H 'Content-Type: application/json' \\`,
     `       -d '{"assignee":"${escalateTo}"}'`,
-    `  c) Csak EZUTÁN állítsd a kártyát status="waiting"-re (a fenti move-hívással, "waiting" értékkel "done" helyett).`,
+    `  c) Csak EZUTÁN állítsd a kártyát state="blocked"-ra a fenti /move hívással.`,
     isMainAgent
       ? `Ez azért kritikus, mert ${OWNER_NAME} nem tudja kitalálni a dashboardon hogy egy nála maradt/rossz-assignee-jű, homályos kártya rá vár -- explicit átadás + explicit kérdés nélkül a felelősség-váltás elvész.`
       : `FONTOS: ${OWNER_NAME}-hez (az operátorhoz) EGYENESEN NE told át a kártyát, még ha a blokk végül tőle igényel is döntést -- ${MAIN_AGENT_ID} a delegálód, ő triázsol és ő dönti el, hogy tovább kell-e ${OWNER_NAME}-hez eszkalálnia. Ez azért kritikus, mert ${MAIN_AGENT_ID} nem tudja kitalálni a dashboardon hogy egy nála maradt/rossz-assignee-jű kártya rá vár -- explicit átadás + explicit kérdés nélkül a felelősség-váltás elvész.`,
-    'A "done"-t mindenképp te jelezd — a dashboard csak az in_progress/waiting állapotot követi automatikusan a session aktivitásából. Az eredmény-kommentet (1) ne hagyd ki: az a kártyán a látható eredmény.',
+    'Az eredmény-kommentet (1) ne hagyd ki: az a kártyán a látható eredmény. VERIFY után az ellenőrző választ DONE vagy REPAIR állapotot.',
   ].join('\n')
 }
 
@@ -315,8 +334,22 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
   if (path === '/api/kanban' && method === 'POST') {
     const body = await readBody(req)
     const data = JSON.parse(body.toString())
+    let initialState: 'new' | 'ready'
+    try {
+      initialState = resolveInitialWorkflowState(data)
+    } catch (error) {
+      if (error instanceof WorkflowCreationError) {
+        json(res, { error: error.message, code: error.code }, 400)
+        return true
+      }
+      throw error
+    }
+    if (data.lane !== undefined && data.lane !== null && !isValidLane(data.lane)) {
+      json(res, { error: `Ismeretlen lane: "${data.lane}". Érvényes: ${KANBAN_LANES.join(', ')}` }, 400)
+      return true
+    }
     const id = randomUUID().slice(0, 8)
-    createKanbanCard({ id, ...data })
+    createKanbanCard({ ...data, state: initialState, workflow_state: undefined, status: undefined, id })
     json(res, { ok: true, id })
     return true
   }
@@ -326,7 +359,43 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     const id = decodeURIComponent(kanbanCardMatch[1])
     const body = await readBody(req)
     const data = JSON.parse(body.toString())
-    if (updateKanbanCard(id, data)) { json(res, { ok: true }); return true }
+
+    if (Object.prototype.hasOwnProperty.call(data, 'status') || Object.prototype.hasOwnProperty.call(data, 'state') || Object.prototype.hasOwnProperty.call(data, 'workflow_state')) {
+      json(res, { error: 'Workflow state csak a /move végponton módosítható', code: 'workflow_move_required' }, 409)
+      return true
+    }
+
+    // §23-24 lane-WIP gate (TASK-0018 review blocker #4): a direct PUT that
+    // sets status:'in_progress' bypassed the gate entirely before this,
+    // because only the /move route checked it. Route it through the same
+    // atomic gate as /move (updateKanbanCardWithLaneGate).
+    if (data.lane !== undefined && data.lane !== null && !isValidLane(data.lane)) {
+      json(res, { error: `Ismeretlen lane: "${data.lane}". Érvényes: ${KANBAN_LANES.join(', ')}` }, 400)
+      return true
+    }
+    const result = updateKanbanCardWithLaneGate(id, data)
+    if (result.laneRequired) {
+      json(res, {
+        error: `Az in_progress állapothoz execution lane szükséges. Érvényes: ${KANBAN_LANES.join(', ')}`,
+        code: 'lane_required',
+        lanes: KANBAN_LANES,
+      }, 400)
+      return true
+    }
+    if (result.laneGate && !result.laneGate.allowed && !result.updated) {
+      json(res, {
+        error: `Lane WIP limit elérve (${result.laneGate.lane}: ${result.laneGate.runningCount}/${result.laneGate.limit} már fut) -- §23/§24 One Piece Flow`,
+        decision: result.laneGate,
+      }, 409)
+      return true
+    }
+    if (result.updated) {
+      if (result.laneGate && !result.laneGate.allowed) {
+        logger.warn({ id, laneGate: result.laneGate }, 'Kanban lane WIP limit exceeded via PUT (canary warn-only, not blocking)')
+      }
+      json(res, result.laneGate && !result.laneGate.allowed ? { ok: true, wip_warning: result.laneGate } : { ok: true })
+      return true
+    }
     json(res, { error: 'Kártya nem található' }, 404)
     return true
   }
@@ -343,12 +412,62 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
   if (kanbanMoveMatch && method === 'POST') {
     const id = decodeURIComponent(kanbanMoveMatch[1])
     const body = await readBody(req)
-    const { status, sort_order, actor } = JSON.parse(body.toString())
-    if (moveKanbanCard(id, status, sort_order ?? 0, actor)) {
+    const { status, state, workflow_state, sort_order, actor, lane } = JSON.parse(body.toString())
+    let requestedState
+    try {
+      requestedState = resolveWorkflowTransitionState({ state, workflow_state, status })
+    } catch (error) {
+      if (error instanceof WorkflowCreationError) {
+        json(res, { error: error.message, code: error.code }, 400)
+        return true
+      }
+      throw error
+    }
+
+    // §23-24 One Piece Flow / Execution Lanes (governance v1.0, TASK-0018).
+    // Lane-tagging is opt-in on first entry; re-entry (done|waiting ->
+    // in_progress without resending lane) falls back to the card's
+    // already-stored lane instead of silently exiting the gate (review
+    // blocker #2). Count+decide+write happen atomically in a single
+    // transaction (review blocker #3) -- see moveKanbanCardWithLaneGate.
+    if (lane !== undefined && lane !== null && !isValidLane(lane)) {
+      json(res, { error: `Ismeretlen lane: "${lane}". Érvényes: ${KANBAN_LANES.join(', ')}` }, 400)
+      return true
+    }
+    const result = transitionKanbanWorkflowState(id, requestedState, sort_order ?? 0, actor, lane, undefined,
+      undefined)
+    if (result.laneRequired) {
+      json(res, {
+        error: `Az in_progress állapothoz execution lane szükséges. Érvényes: ${KANBAN_LANES.join(', ')}`,
+        code: 'lane_required',
+        lanes: KANBAN_LANES,
+      }, 400)
+      return true
+    }
+    if (result.laneGate && !result.laneGate.allowed && !('updated' in result ? result.updated : result.changed)) {
+      json(res, {
+        error: `Lane WIP limit elérve (${result.laneGate.lane}: ${result.laneGate.runningCount}/${result.laneGate.limit} már fut) -- §23/§24 One Piece Flow`,
+        decision: result.laneGate,
+      }, 409)
+      return true
+    }
+    if (result.changed) {
+      if (result.laneGate && !result.laneGate.allowed) {
+        // Canary/warn-only (default): the move still succeeded, but the
+        // violation is logged and surfaced in the response so it can be
+        // measured before KANBAN_LANE_WIP_ENFORCE is ever flipped to true.
+        logger.warn({ id, laneGate: result.laneGate }, 'Kanban lane WIP limit exceeded (canary warn-only, not blocking)')
+      }
       // Wake the assigned agent once when the card enters in_progress -- unless
       // that agent is the one who moved it (self-pickup needs no wake-up).
-      if (status === 'in_progress') fireKanbanDispatch(id, actor)
-      json(res, { ok: true })
+      if (result.state === 'running') fireKanbanDispatch(id, actor)
+      json(res, result.laneGate && !result.laneGate.allowed
+        ? { ok: true, state: result.state, reason: result.reason, correlation_id: result.correlationId, wip_warning: result.laneGate }
+        : { ok: true, state: result.state, reason: result.reason, correlation_id: result.correlationId })
+      return true
+    }
+    if (result.reason === 'invalid_transition') {
+      json(res, { error: 'Érvénytelen workflow átmenet', code: 'invalid_transition', state: result.state }, 409)
       return true
     }
     json(res, { error: 'Kártya nem található' }, 404)
@@ -382,7 +501,17 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
   const kanbanUnarchiveMatch = path.match(/^\/api\/kanban\/([^/]+)\/unarchive$/)
   if (kanbanUnarchiveMatch && method === 'POST') {
     const id = decodeURIComponent(kanbanUnarchiveMatch[1])
-    if (unarchiveKanbanCard(id)) { json(res, { ok: true }); return true }
+    const card = getKanbanCard(id)
+    const enforce = resolveLaneWipEnforce()
+    const result = unarchiveKanbanCardWithLaneGate(id, {
+      limit: card?.lane ? resolveLaneWipLimit(card.lane) : 0,
+      enforce,
+    })
+    if (result.laneGate && !result.laneGate.allowed && enforce) {
+      json(res, { error: 'Lane WIP limit elérve', decision: result.laneGate }, 409)
+      return true
+    }
+    if (result.unarchived) { json(res, result.laneGate && !result.laneGate.allowed ? { ok: true, wip_warning: result.laneGate } : { ok: true }); return true }
     json(res, { error: 'Kártya nem található vagy nincs archiválva' }, 404)
     return true
   }

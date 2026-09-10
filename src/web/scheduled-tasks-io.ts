@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { MAIN_AGENT_ID } from '../config.js'
 import { atomicWriteFileSync } from './atomic-write.js'
+import { allowedExpectedOutputFile } from './schedule-output-verifier.js'
 
 export const SCHEDULED_TASKS_DIR = join(homedir(), '.claude', 'scheduled-tasks')
 
@@ -21,7 +22,7 @@ export interface ScheduledTask {
   agent: string
   enabled: boolean
   createdAt: number
-  type?: 'task' | 'heartbeat' | 'command'  // heartbeat = silent unless important; command = raw shell, no LLM
+  type?: 'task' | 'heartbeat' | 'command' | 'dream-engine'  // heartbeat = silent unless important; command = raw shell, no LLM
   // When true, a tick whose target session is busy is dropped silently
   // instead of queued. Use ONLY for cron schedules that fire often enough
   // (every 30-60 min) that losing a single tick is harmless because the
@@ -67,6 +68,9 @@ export interface ScheduledTask {
   // DISTINCT from catchUpMaxAgeMinutes: that one judges a MISSED occurrence's
   // staleness before firing; this one judges a RUNNING injection's age.
   stuckAfterMinutes?: number
+  // Opt-in output freshness verification. Parsing accepts only the exact
+  // filename allowlisted for this task name; this is never a free-form path.
+  expectedOutputFile?: string
   // Manifest-style requirements (Roitman 22.5). When mcp_servers is set, the
   // runner pre-checks each named MCP server has a live process under the
   // target session before injecting the prompt; a dead server defers the task
@@ -104,7 +108,7 @@ export function readScheduledTask(taskName: string): ScheduledTask | null {
   const skillContent = hasSkill ? readFileOr(skillPath, '') : ''
   const { name, description, body } = parseSkillMdFrontmatter(skillContent)
 
-  let config: { schedule?: string; agent?: string; enabled?: boolean; createdAt?: number; type?: string; skipIfBusy?: boolean; forceSend?: boolean; targetSession?: string; description?: string; command?: string; timeoutMs?: number; failThreshold?: number; preCheck?: string; catchUpMaxAgeMinutes?: unknown; stuckAfterMinutes?: unknown; requires?: { mcp_servers?: unknown } } = {}
+  let config: { schedule?: string; agent?: string; enabled?: boolean; createdAt?: number; type?: string; skipIfBusy?: boolean; forceSend?: boolean; targetSession?: string; description?: string; command?: string; timeoutMs?: number; failThreshold?: number; preCheck?: string; catchUpMaxAgeMinutes?: unknown; stuckAfterMinutes?: unknown; expectedOutputFile?: unknown; requires?: { mcp_servers?: unknown } } = {}
   try {
     config = JSON.parse(readFileOr(configPath, '{}'))
   } catch { /* use defaults */ }
@@ -117,7 +121,7 @@ export function readScheduledTask(taskName: string): ScheduledTask | null {
     agent: config.agent || MAIN_AGENT_ID,
     enabled: config.enabled !== false,
     createdAt: config.createdAt || 0,
-    type: (config.type as 'task' | 'heartbeat' | 'command') || 'task',
+    type: (config.type as ScheduledTask['type']) || 'task',
     skipIfBusy: config.skipIfBusy === true,
     forceSend: config.forceSend === true,
     targetSession: config.targetSession || undefined,
@@ -127,6 +131,7 @@ export function readScheduledTask(taskName: string): ScheduledTask | null {
     preCheck: config.preCheck,
     catchUpMaxAgeMinutes: parseCatchUpMaxAge(config.catchUpMaxAgeMinutes),
     stuckAfterMinutes: parseFiniteMinutes(config.stuckAfterMinutes),
+    expectedOutputFile: parseExpectedOutputFile(taskName, config.expectedOutputFile),
     requires: parseRequires(config.requires),
   }
 }
@@ -143,6 +148,10 @@ export function parseFiniteMinutes(raw: unknown): number | undefined {
 // catchUpMaxAgeMs / resolveStuckTimeoutMs, not here).
 export function parseCatchUpMaxAge(raw: unknown): number | undefined {
   return parseFiniteMinutes(raw)
+}
+
+export function parseExpectedOutputFile(taskName: string, raw: unknown): string | undefined {
+  return allowedExpectedOutputFile(taskName, raw)
 }
 
 // Accept only a string array for requires.mcp_servers; anything else is

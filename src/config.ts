@@ -319,6 +319,18 @@ export const KANBAN_WIP_OK_COLOR = env['KANBAN_WIP_OK_COLOR'] ?? '#6b7280'
 export const KANBAN_WIP_WARN_COLOR = env['KANBAN_WIP_WARN_COLOR'] ?? '#c9a000'
 export const KANBAN_WIP_FULL_COLOR = env['KANBAN_WIP_FULL_COLOR'] ?? '#d46b00'
 export const KANBAN_WIP_OVER_COLOR = env['KANBAN_WIP_OVER_COLOR'] ?? '#c53030'
+// §23-24 One Piece Flow / Execution Lanes (governance v1.0, TASK-0018).
+// RUNNING <= 1 per lane by default. Canary pattern (§37/§68, same as Context
+// Gate): KANBAN_LANE_WIP_ENFORCE defaults to false (warn-only -- the move
+// still succeeds but the response carries a wip_warning and the event is
+// logged), so the mechanism can be observed against real traffic before it
+// can block a move. Flip it to true only after that observation window.
+//
+// Both lane keys require restart. db.ts resolves overrides > .env > defaults
+// at initialization and atomically publishes all six lanes in SQLite. Routes
+// read that same committed policy, not pending settings-store overrides.
+// KANBAN_LANE_WIP_LIMIT_<LANE> is an advanced .env override, also restart-only.
+// See docs/kanban-lane-policy.md for rollout and multi-process restart rules.
 // requiresRestart registry keys: read through the override layer so a value
 // saved on the Settings page takes effect on the next restart.
 export const DASHBOARD_PUBLIC_URL = cfg('DASHBOARD_PUBLIC_URL') ?? ''
@@ -329,6 +341,7 @@ export const DASHBOARD_PUBLIC_URL = cfg('DASHBOARD_PUBLIC_URL') ?? ''
 // key, so it stays a plain env read (not routed through the override layer).
 export const DASHBOARD_ALLOWED_ORIGINS = env['DASHBOARD_ALLOWED_ORIGINS'] ?? ''
 export const OLLAMA_URL = cfg('OLLAMA_URL') ?? 'http://localhost:11434'
+export const CONTEXT_GATE_CANARY_ENABLED = cfg('CONTEXT_GATE_CANARY_ENABLED') === '1'
 
 // Kanban swimlanes: which field the board groups by on first load. Invalid
 // values silently fall back to 'none' (flat board) rather than breaking the

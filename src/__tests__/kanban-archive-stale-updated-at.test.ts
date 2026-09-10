@@ -14,7 +14,7 @@
 // feature off).
 
 import { describe, it, expect, beforeEach } from 'vitest'
-import { initDatabase, getDb, listKanbanCards, getKanbanCard, createKanbanCard } from '../db.js'
+import { initDatabase, getDb, listKanbanCards, getKanbanCard, createKanbanCard, transitionKanbanWorkflowState } from '../db.js'
 
 beforeEach(() => {
   initDatabase(':memory:')
@@ -37,6 +37,18 @@ describe('kanban_cards_status_bumps_updated_at trigger', () => {
     expect(card.status).toBe('done')
     expect(card.updated_at).toBeGreaterThan(OLD)
     expect(card.updated_at).toBeGreaterThanOrEqual(Math.floor(Date.now() / 1000) - 5)
+  })
+
+  it('bumps updated_at for a preserved legacy NULL-ID row using rowid', () => {
+    const db = getDb()
+    db.exec('DROP TRIGGER kanban_id_required_insert')
+    db.prepare(
+      `INSERT INTO kanban_cards (rowid, id, title, status, priority, created_at, updated_at)
+       VALUES (71, NULL, 'legacy raw card', 'planned', 'normal', ?, ?)`
+    ).run(OLD, OLD)
+    db.prepare("UPDATE kanban_cards SET status = 'done' WHERE rowid = 71").run()
+    expect(db.prepare('SELECT updated_at FROM kanban_cards WHERE rowid=71').get()).toMatchObject({ updated_at: expect.any(Number) })
+    expect((db.prepare('SELECT updated_at FROM kanban_cards WHERE rowid=71').get() as { updated_at: number }).updated_at).toBeGreaterThan(OLD)
   })
 
   it('does not touch updated_at when a raw SQL UPDATE sets status to its current value (no-op)', () => {
@@ -99,8 +111,11 @@ describe('listKanbanCards auto-archive vs. raw SQL status writes', () => {
     expect(getKanbanCard('genuinely-old')!.archived_at).not.toBeNull()
   })
 
-  it('does not archive a done card moved via the production entry point (createKanbanCard + status: done)', () => {
-    createKanbanCard({ id: 'prod-done', title: 'created done today', status: 'done' })
+  it('does not archive a card moved to done via production workflow transitions', () => {
+    createKanbanCard({ id: 'prod-done', title: 'created done today' })
+    transitionKanbanWorkflowState('prod-done', 'running', 0, 'test', 'DEVELOPMENT')
+    transitionKanbanWorkflowState('prod-done', 'verify', 0, 'test')
+    transitionKanbanWorkflowState('prod-done', 'done', 0, 'test')
 
     listKanbanCards()
 

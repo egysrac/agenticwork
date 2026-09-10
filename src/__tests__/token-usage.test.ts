@@ -3,7 +3,13 @@ import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { getDb, initDatabase, pruneTokenUsage } from '../db.js'
 
-const TEST_DIR = '/tmp/test-token-usage'
+const TEST_DIR = await vi.hoisted(async () => {
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  return mkdtempSync(join(tmpdir(), 'token-usage-'))
+})
+vi.mock('../env.js', () => ({ readEnvFile: () => ({}) }))
 const PROJECTS_DIR = join(TEST_DIR, '.claude', 'projects')
 
 vi.mock('../config.js', async () => {
@@ -11,7 +17,7 @@ vi.mock('../config.js', async () => {
   return {
     ...actual,
     MAIN_AGENT_ID: 'marveen',
-    STORE_DIR: actual.STORE_DIR,
+    STORE_DIR: TEST_DIR,
     DB_FILENAME: actual.DB_FILENAME,
   }
 })
@@ -340,11 +346,13 @@ describe('correlateWithKanban', () => {
     const db = getDb()
     const baseTs = 1716200000
 
-    // Insert a kanban card (created_at is NOT NULL)
+    // Insert a current-policy kanban card with an execution lane. This fixture
+    // models active work, not a legacy fleet snapshot, so it must satisfy the
+    // same DB invariant as production writes.
     db.prepare(`
-      INSERT OR IGNORE INTO kanban_cards (id, title, status, priority, assignee, project, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run('test-kanban-1', 'Test Task', 'in_progress', 'normal', 'test-main', 'test-project', baseTs, baseTs)
+      INSERT OR IGNORE INTO kanban_cards (id, title, status, priority, assignee, project, created_at, updated_at, lane)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('test-kanban-1', 'Test Task', 'in_progress', 'normal', 'test-main', 'test-project', baseTs, baseTs, 'DEVELOPMENT')
 
     const { correlateWithKanban } = await import('../web/token-usage.js')
     correlateWithKanban()

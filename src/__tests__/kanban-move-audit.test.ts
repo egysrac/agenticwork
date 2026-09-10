@@ -10,7 +10,7 @@
 // schema, the same way the other kanban db tests do.
 
 import { describe, it, expect, beforeEach } from 'vitest'
-import { initDatabase, createKanbanCard, moveKanbanCard, getKanbanCardEvents } from '../db.js'
+import { initDatabase, createKanbanCard, moveKanbanCard, moveKanbanCardWithLaneGate, getKanbanCardEvents, transitionKanbanWorkflowState } from '../db.js'
 
 beforeEach(() => {
   // Re-init with an in-memory database for isolation.
@@ -21,8 +21,8 @@ describe('kanban move audit trail', () => {
   it('records exactly one event with correct from/to status and actor on a status change', () => {
     createKanbanCard({ id: 'card-a', title: 'Audited card' })
 
-    const moved = moveKanbanCard('card-a', 'in_progress', 1, 'marveen')
-    expect(moved).toBe(true)
+    const moved = moveKanbanCardWithLaneGate('card-a', 'in_progress', 1, 'marveen', 'DEVELOPMENT', { limit: 1, enforce: true })
+    expect(moved.changed).toBe(true)
 
     const events = getKanbanCardEvents('card-a')
     expect(events).toHaveLength(1)
@@ -62,13 +62,13 @@ describe('kanban move audit trail', () => {
   it('returns events in chronological order across multiple moves', () => {
     createKanbanCard({ id: 'card-d', title: 'Multi-move card' })
 
-    moveKanbanCard('card-d', 'in_progress', 0, 'marveen')
-    moveKanbanCard('card-d', 'waiting', 0, 'samu')
-    moveKanbanCard('card-d', 'done', 0, 'marveen')
+    moveKanbanCardWithLaneGate('card-d', 'in_progress', 0, 'marveen', 'DEVELOPMENT', { limit: 1, enforce: true })
+    transitionKanbanWorkflowState('card-d', 'verify', 0, 'samu')
+    transitionKanbanWorkflowState('card-d', 'done', 0, 'marveen')
 
     const events = getKanbanCardEvents('card-d')
-    expect(events.map((e) => e.to_status)).toEqual(['in_progress', 'waiting', 'done'])
-    expect(events.map((e) => e.from_status)).toEqual(['planned', 'in_progress', 'waiting'])
+    expect(events.map((e) => e.to_status)).toEqual(['in_progress', 'testing', 'done'])
+    expect(events.map((e) => e.from_status)).toEqual(['planned', 'in_progress', 'testing'])
     // created_at is monotonically non-decreasing and the id ordering breaks ties.
     for (let i = 1; i < events.length; i++) {
       expect(events[i].created_at).toBeGreaterThanOrEqual(events[i - 1].created_at)

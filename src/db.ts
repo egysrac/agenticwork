@@ -1,10 +1,23 @@
 import Database from 'better-sqlite3'
 import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, chmodSync, openSync, closeSync, statSync } from 'node:fs'
 import { STORE_DIR, DB_FILENAME, ALLOWED_CHAT_ID, OLLAMA_URL, APP_TZ } from './config.js'
 import { getEffectiveSettingValue } from './settings-store.js'
 import { logger } from './logger.js'
 import { TOOL_TIMEOUTS } from './tool-timeouts.js'
+import { KANBAN_LANES, isValidLane, parseLaneWipLimit } from './kanban-lane-wip.js'
+import { readEnvFile } from './env.js'
+import {
+  decideWorkflowTransition,
+  isWorkflowState,
+  isWorkflowStateCompatibleWithLegacyStatus,
+  legacyStatusForWorkflowState,
+  resolveInitialWorkflowState,
+  type WorkflowState,
+  workflowStateFromLegacyStatus,
+} from './kanban-workflow.js'
+import { appendTaskObservation, migrateTaskObservability } from './task-observability.js'
 
 let db: Database.Database
 // The path the CURRENT handle was opened on (null for ':memory:'). Kept so
@@ -72,6 +85,7 @@ export function initDatabase(dbPathOverride?: string): void {
   db = new Database(dbPath)
   openedDbPath = isMemory ? null : dbPath
   db.pragma('journal_mode = WAL')
+  db.pragma('busy_timeout = 5000')
   // Performance pragmas: safe with WAL, applied after journal_mode is set.
   // cache_size: negative value = kibibytes; -65536 → 64 MB page cache.
   // mmap_size: memory-mapped I/O in bytes; 256 MB. Skipped for :memory: (no file to map).
@@ -190,42 +204,190 @@ export function initDatabase(dbPathOverride?: string): void {
   } catch {
     // column already exists
   }
-  // Migration: add 'testing' status to kanban_cards CHECK constraint.
-  // SQLite can't ALTER a CHECK constraint, so we recreate the table when the
-  // current schema doesn't yet include 'testing'. Idempotent on fresh DBs.
-  try {
-    const kcSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='kanban_cards'").get() as { sql: string } | undefined
-    if (kcSchema?.sql && !kcSchema.sql.includes("'testing'")) {
-      db.exec(`
-        CREATE TABLE kanban_cards_new (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          description TEXT,
-          status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','in_progress','testing','waiting','done')),
-          assignee TEXT,
-          priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high','urgent')),
-          project TEXT,
-          due_date INTEGER,
-          sort_order REAL NOT NULL DEFAULT 0,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          archived_at INTEGER,
-          parent_id TEXT REFERENCES kanban_cards_new(id),
-          dispatched_at INTEGER
-        );
-        INSERT INTO kanban_cards_new
-          SELECT id, title, description, status, assignee, priority, project, due_date,
-                 sort_order, created_at, updated_at, archived_at, parent_id, dispatched_at
-          FROM kanban_cards;
-        DROP TABLE kanban_cards;
-        ALTER TABLE kanban_cards_new RENAME TO kanban_cards;
-      `)
-      db.exec(`CREATE INDEX IF NOT EXISTS idx_kanban_parent ON kanban_cards(parent_id)`)
-      db.exec(`CREATE INDEX IF NOT EXISTS idx_kanban_status ON kanban_cards(status, archived_at)`)
+  // Migration: add lane to kanban_cards (§23-24 One Piece Flow / Execution
+  // Lanes -- governance v1.0). Nullable and additive: existing cards keep
+  // lane=NULL, which structurally excludes them from the new per-lane WIP
+  // count (see countInProgressInLane) without touching their status. This is
+  // deliberate -- §29/§31 forbid bulk-migrating the legacy backlog just
+  // because a new column exists.
+  // SQLite cannot ALTER CHECK constraints. Rebuild exactly once under an
+  // EXCLUSIVE transaction so concurrent processes cannot observe or race a
+  // partially migrated table. Preserve rowid explicitly: it is the stable,
+  // human-facing kanban #seq identifier and may contain deletion gaps.
+  const laneCheckList = KANBAN_LANES.map((l) => `'${l}'`).join(',')
+  const globalLaneLimit = parseLaneWipLimit(getEffectiveSettingValue('KANBAN_LANE_WIP_LIMIT'), 1)
+  const laneLimitEnvKeys = KANBAN_LANES.map((lane) => `KANBAN_LANE_WIP_LIMIT_${lane}`)
+  const laneLimitOverrides = readEnvFile(laneLimitEnvKeys)
+  const laneEnforce = String(getEffectiveSettingValue('KANBAN_LANE_WIP_ENFORCE')) === '1' ? 1 : 0
+  const migrateKanbanChecks = db.transaction(() => {
+    try { db.exec('ALTER TABLE kanban_cards ADD COLUMN lane TEXT') } catch { /* already present */ }
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='kanban_cards'").get() as { sql: string } | undefined
+    if (schema?.sql && !(schema.sql.includes("'testing'") && schema.sql.includes('lane TEXT CHECK'))) db.exec(`
+      CREATE TABLE kanban_cards_lane_new (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT,
+        status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','in_progress','testing','waiting','done')),
+        assignee TEXT,
+        priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high','urgent')),
+        project TEXT,
+        due_date INTEGER,
+        sort_order REAL NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        archived_at INTEGER,
+        parent_id TEXT REFERENCES kanban_cards_lane_new(id),
+        dispatched_at INTEGER,
+        lane TEXT CHECK(lane IS NULL OR lane IN (${laneCheckList}))
+      );
+      INSERT INTO kanban_cards_lane_new
+        (rowid, id, title, description, status, assignee, priority, project, due_date,
+         sort_order, created_at, updated_at, archived_at, parent_id, dispatched_at, lane)
+        SELECT rowid, id, title, description, status, assignee, priority, project, due_date,
+               sort_order, created_at, updated_at, archived_at, parent_id, dispatched_at, lane
+        FROM kanban_cards;
+      DROP TABLE kanban_cards;
+      ALTER TABLE kanban_cards_lane_new RENAME TO kanban_cards;
+    `)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_kanban_parent ON kanban_cards(parent_id)`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_kanban_status ON kanban_cards(status, archived_at)`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_kanban_lane_status_archive ON kanban_cards(lane, status, archived_at)`)
+    // Persistent, database-native policy state keeps triggers valid for every
+    // SQLite connection. These settings intentionally take effect on restart,
+    // so raw writers and HTTP writers always observe the same policy snapshot.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS kanban_lane_policy (
+        lane TEXT PRIMARY KEY CHECK(lane IN (${laneCheckList})),
+        limit_value INTEGER NOT NULL CHECK(limit_value BETWEEN 0 AND 100),
+        enforce INTEGER NOT NULL CHECK(enforce IN (0,1))
+      );
+      CREATE TABLE IF NOT EXISTS kanban_runtime_flags (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+      );
+      DELETE FROM kanban_runtime_flags;
+    `)
+    const upsertLanePolicy = db.prepare(`
+      INSERT INTO kanban_lane_policy (lane, limit_value, enforce) VALUES (?, ?, ?)
+      ON CONFLICT(lane) DO UPDATE SET limit_value=excluded.limit_value, enforce=excluded.enforce
+    `)
+    for (const lane of KANBAN_LANES) {
+      const key = `KANBAN_LANE_WIP_LIMIT_${lane}`
+      const limit = laneLimitOverrides[key] === undefined
+        ? globalLaneLimit
+        : parseLaneWipLimit(laneLimitOverrides[key], globalLaneLimit)
+      upsertLanePolicy.run(lane, limit, laneEnforce)
     }
-  } catch (err) {
-    logger.warn({ err }, 'kanban_cards testing-status migration failed -- continuing')
-  }
+    db.exec(`
+    DROP TRIGGER IF EXISTS kanban_id_required_insert;
+    CREATE TRIGGER kanban_id_required_insert BEFORE INSERT ON kanban_cards
+    WHEN NEW.id IS NULL
+    BEGIN SELECT RAISE(ABORT, 'kanban id required'); END;
+    DROP TRIGGER IF EXISTS kanban_id_required_update;
+    CREATE TRIGGER kanban_id_required_update BEFORE UPDATE OF id ON kanban_cards
+    WHEN NEW.id IS NULL AND OLD.id IS NOT NULL
+    BEGIN SELECT RAISE(ABORT, 'kanban id required'); END;
+    DROP TRIGGER IF EXISTS kanban_lane_required_insert;
+    CREATE TRIGGER kanban_lane_required_insert
+    BEFORE INSERT ON kanban_cards
+    WHEN NEW.status = 'in_progress' AND NEW.lane IS NULL AND NOT EXISTS (SELECT 1 FROM kanban_runtime_flags WHERE key='legacy_import' AND value=1)
+    BEGIN
+      SELECT RAISE(ABORT, 'execution lane required for in_progress');
+    END;
+
+    DROP TRIGGER IF EXISTS kanban_lane_required_update;
+    CREATE TRIGGER kanban_lane_required_update
+    BEFORE UPDATE OF status, lane ON kanban_cards
+    WHEN NEW.status = 'in_progress' AND NEW.lane IS NULL
+      AND NOT (OLD.status = 'in_progress' AND OLD.lane IS NULL)
+    BEGIN
+      SELECT RAISE(ABORT, 'execution lane required for in_progress');
+    END;
+
+    DROP TRIGGER IF EXISTS kanban_lane_no_clear;
+    CREATE TRIGGER kanban_lane_no_clear
+    BEFORE UPDATE OF lane ON kanban_cards
+    WHEN OLD.lane IS NOT NULL AND NEW.lane IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'execution lane cannot be cleared');
+    END;
+
+    DROP TRIGGER IF EXISTS kanban_lane_wip_insert;
+    CREATE TRIGGER kanban_lane_wip_insert BEFORE INSERT ON kanban_cards
+    WHEN NEW.status='in_progress' AND NEW.archived_at IS NULL AND NEW.lane IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM kanban_runtime_flags WHERE key='legacy_import' AND value=1) AND (SELECT enforce FROM kanban_lane_policy WHERE lane=NEW.lane)=1 AND (SELECT limit_value FROM kanban_lane_policy WHERE lane=NEW.lane)>0
+      AND (SELECT COUNT(*) FROM kanban_cards WHERE status='in_progress' AND archived_at IS NULL AND lane=NEW.lane) >= (SELECT limit_value FROM kanban_lane_policy WHERE lane=NEW.lane)
+    BEGIN SELECT RAISE(ABORT, 'execution lane WIP limit reached'); END;
+
+    DROP TRIGGER IF EXISTS kanban_lane_wip_update;
+    CREATE TRIGGER kanban_lane_wip_update BEFORE UPDATE ON kanban_cards
+    WHEN NEW.status='in_progress' AND NEW.archived_at IS NULL AND NEW.lane IS NOT NULL
+      AND NOT (OLD.status='in_progress' AND OLD.archived_at IS NULL AND OLD.lane IS NEW.lane)
+      AND NOT EXISTS (SELECT 1 FROM kanban_runtime_flags WHERE key='legacy_import' AND value=1) AND (SELECT enforce FROM kanban_lane_policy WHERE lane=NEW.lane)=1 AND (SELECT limit_value FROM kanban_lane_policy WHERE lane=NEW.lane)>0
+      AND (SELECT COUNT(*) FROM kanban_cards WHERE status='in_progress' AND archived_at IS NULL AND lane=NEW.lane AND rowid<>OLD.rowid) >= (SELECT limit_value FROM kanban_lane_policy WHERE lane=NEW.lane)
+    BEGIN SELECT RAISE(ABORT, 'execution lane WIP limit reached'); END;
+  `)
+  })
+  // Lane add/rebuild/index/trigger installation is one exclusive migration.
+  migrateKanbanChecks.exclusive()
+  // TASK-0019: additive canonical workflow. Legacy `status` remains intact as
+  // the compatibility projection, so an old binary can still read this DB.
+  // ALTER TABLE preserves rowid and all existing card data.
+  const migrateKanbanWorkflow = db.transaction(() => {
+    try {
+      db.exec("ALTER TABLE kanban_cards ADD COLUMN workflow_state TEXT CHECK(workflow_state IN ('new','ready','running','verify','repair','blocked','done'))")
+    } catch { /* already present */ }
+    try {
+      db.exec('ALTER TABLE kanban_cards ADD COLUMN repair_attempts INTEGER NOT NULL DEFAULT 0 CHECK(repair_attempts >= 0)')
+    } catch { /* already present */ }
+    // Legacy rows stay NULL until an explicit workflow/status write. Repair
+    // only already-divergent canonical rows; this is not a backlog backfill.
+    db.exec(`UPDATE kanban_cards SET workflow_state = CASE status
+      WHEN 'planned' THEN 'ready' WHEN 'in_progress' THEN 'running'
+      WHEN 'testing' THEN 'verify' WHEN 'waiting' THEN 'blocked' WHEN 'done' THEN 'done'
+    END WHERE workflow_state IS NOT NULL AND NOT (
+      (status='planned' AND workflow_state IN ('new','ready')) OR
+      (status='in_progress' AND workflow_state='running') OR
+      (status='testing' AND workflow_state IN ('verify','repair')) OR
+      (status='waiting' AND workflow_state='blocked') OR
+      (status='done' AND workflow_state='done'))`)
+
+    db.exec(`
+      DROP TRIGGER IF EXISTS kanban_workflow_consistent_insert;
+      CREATE TRIGGER kanban_workflow_consistent_insert BEFORE INSERT ON kanban_cards
+      WHEN NEW.workflow_state IS NOT NULL AND NOT (
+        (NEW.status='planned' AND NEW.workflow_state IN ('new','ready')) OR
+        (NEW.status='in_progress' AND NEW.workflow_state='running') OR
+        (NEW.status='testing' AND NEW.workflow_state IN ('verify','repair')) OR
+        (NEW.status='waiting' AND NEW.workflow_state='blocked') OR
+        (NEW.status='done' AND NEW.workflow_state='done'))
+      BEGIN SELECT RAISE(ABORT, 'conflicting workflow state and legacy status'); END;
+
+      DROP TRIGGER IF EXISTS kanban_workflow_consistent_canonical_update;
+      CREATE TRIGGER kanban_workflow_consistent_canonical_update BEFORE UPDATE OF workflow_state ON kanban_cards
+      WHEN NEW.workflow_state IS NOT NULL AND NOT (
+        (NEW.status='planned' AND NEW.workflow_state IN ('new','ready')) OR
+        (NEW.status='in_progress' AND NEW.workflow_state='running') OR
+        (NEW.status='testing' AND NEW.workflow_state IN ('verify','repair')) OR
+        (NEW.status='waiting' AND NEW.workflow_state='blocked') OR
+        (NEW.status='done' AND NEW.workflow_state='done'))
+      BEGIN SELECT RAISE(ABORT, 'conflicting workflow state and legacy status'); END;
+
+      DROP TRIGGER IF EXISTS kanban_workflow_reconcile_legacy_status;
+      CREATE TRIGGER kanban_workflow_reconcile_legacy_status AFTER UPDATE OF status ON kanban_cards
+      WHEN OLD.status IS NOT NEW.status AND (NEW.workflow_state IS NULL OR NOT (
+        (NEW.status='planned' AND NEW.workflow_state IN ('new','ready')) OR
+        (NEW.status='in_progress' AND NEW.workflow_state='running') OR
+        (NEW.status='testing' AND NEW.workflow_state IN ('verify','repair')) OR
+        (NEW.status='waiting' AND NEW.workflow_state='blocked') OR
+        (NEW.status='done' AND NEW.workflow_state='done')))
+      BEGIN UPDATE kanban_cards SET workflow_state = CASE NEW.status
+        WHEN 'planned' THEN 'ready' WHEN 'in_progress' THEN 'running'
+        WHEN 'testing' THEN 'verify' WHEN 'waiting' THEN 'blocked' WHEN 'done' THEN 'done'
+        END WHERE rowid=NEW.rowid; END;
+    `)
+  })
+  migrateKanbanWorkflow.immediate()
   // Migration: add agent_id, category, auto_generated columns to memories
   try {
     db.exec("ALTER TABLE memories ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'marveen'")
@@ -403,6 +565,16 @@ export function initDatabase(dbPathOverride?: string): void {
       created_at INTEGER NOT NULL
     )
   `)
+  try { db.exec('ALTER TABLE kanban_card_events ADD COLUMN from_state TEXT') } catch { /* already present */ }
+  try { db.exec('ALTER TABLE kanban_card_events ADD COLUMN to_state TEXT') } catch { /* already present */ }
+  try { db.exec('ALTER TABLE kanban_card_events ADD COLUMN reason TEXT') } catch { /* already present */ }
+  // TASK-0030 migration: ledger plus its links from the legacy audit table
+  // appear atomically, with no backfill or synthetic history.
+  db.transaction(() => {
+    migrateTaskObservability(db)
+    try { db.exec('ALTER TABLE kanban_card_events ADD COLUMN correlation_id TEXT') } catch { /* already present */ }
+    try { db.exec('ALTER TABLE kanban_card_events ADD COLUMN observation_event_id TEXT') } catch { /* already present */ }
+  }).immediate()
   db.exec(`CREATE INDEX IF NOT EXISTS idx_kanban_events_card ON kanban_card_events(card_id, created_at)`)
 
   // listKanbanCards()'s auto-archive sweep (below) treats a card's updated_at
@@ -421,7 +593,7 @@ export function initDatabase(dbPathOverride?: string): void {
     AFTER UPDATE OF status ON kanban_cards
     FOR EACH ROW WHEN NEW.status != OLD.status AND NEW.updated_at = OLD.updated_at
     BEGIN
-      UPDATE kanban_cards SET updated_at = CAST(strftime('%s','now') AS INTEGER) WHERE id = NEW.id;
+      UPDATE kanban_cards SET updated_at = CAST(strftime('%s','now') AS INTEGER) WHERE rowid = NEW.rowid;
     END
   `)
 
@@ -635,6 +807,14 @@ export function initDatabase(dbPathOverride?: string): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_task_runs_ts ON task_runs(ts)`)
   // Migration: add status column to task_runs (introduced 2026-06-13)
   try { db.exec(`ALTER TABLE task_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'fired'`) } catch { /* already present */ }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS task_output_obligations (
+      task_name TEXT NOT NULL, agent_name TEXT NOT NULL, injected_at INTEGER NOT NULL,
+      session TEXT NOT NULL, host TEXT, working_dir TEXT NOT NULL, config_dir TEXT,
+      timeout_ms INTEGER NOT NULL, output_path TEXT NOT NULL, output_fingerprint TEXT,
+      PRIMARY KEY(task_name, agent_name)
+    )
+  `)
 
   // --- Pending Scheduled Task Retries ---
   // Busy-skipped scheduled tasks used to live in an in-memory Map. On a
@@ -1727,6 +1907,10 @@ export interface KanbanCard {
   title: string
   description: string | null
   status: 'planned' | 'in_progress' | 'waiting' | 'testing' | 'done'
+  workflow_state: WorkflowState
+  /** Canonical API alias; persisted as workflow_state. */
+  state: WorkflowState
+  repair_attempts: number
   assignee: string | null
   priority: 'low' | 'normal' | 'high' | 'urgent'
   project: string | null
@@ -1740,6 +1924,12 @@ export interface KanbanCard {
   // is woken (kanban -> agent dispatch). NULL = never dispatched; the once-only
   // guard so re-dragging a card does not re-prompt the agent.
   dispatched_at: number | null
+  // §23-24 Execution Lane (governance v1.0): DEVELOPMENT/EMAIL/CALENDAR/
+  // MONITORING/MAINTENANCE/ADMIN. NULL = pre-governance / not yet lane-tagged
+  // -- such cards never count toward the per-lane WIP limit (see
+  // countInProgressInLane). Only set when a card enters in_progress with an
+  // explicit lane (opt-in; see moveKanbanCard).
+  lane: string | null
 }
 
 export interface KanbanComment {
@@ -1757,13 +1947,21 @@ export function listKanbanCards(): KanbanCard[] {
   db.prepare(
     "UPDATE kanban_cards SET archived_at = ? WHERE status = 'done' AND archived_at IS NULL AND updated_at < ?"
   ).run(Math.floor(Date.now() / 1000), archiveCutoff)
-  return db
+  return (db
     .prepare('SELECT rowid AS seq, * FROM kanban_cards WHERE archived_at IS NULL ORDER BY sort_order ASC')
-    .all() as KanbanCard[]
+    .all() as Array<Omit<KanbanCard, 'state'>>).map(hydrateKanbanCard)
 }
 
 export function getKanbanCard(id: string): KanbanCard | undefined {
-  return db.prepare('SELECT rowid AS seq, * FROM kanban_cards WHERE id = ?').get(id) as KanbanCard | undefined
+  const card = db.prepare('SELECT rowid AS seq, * FROM kanban_cards WHERE id = ?').get(id) as Omit<KanbanCard, 'state'> | undefined
+  return card ? hydrateKanbanCard(card) : undefined
+}
+
+function hydrateKanbanCard(card: Omit<KanbanCard, 'state'>): KanbanCard {
+  const state = card.workflow_state && isWorkflowStateCompatibleWithLegacyStatus(card.workflow_state, card.status)
+    ? card.workflow_state
+    : workflowStateFromLegacyStatus(card.status)
+  return { ...card, workflow_state: state, state }
 }
 
 export function createKanbanCard(card: {
@@ -1771,58 +1969,319 @@ export function createKanbanCard(card: {
   title: string
   description?: string
   status?: KanbanCard['status']
+  state?: WorkflowState
+  workflow_state?: WorkflowState
   assignee?: string
   priority?: KanbanCard['priority']
   project?: string
   parent_id?: string
   due_date?: number
+  lane?: string | null
 }): void {
   const now = Math.floor(Date.now() / 1000)
-  const status = card.status ?? 'planned'
+  const state = resolveInitialWorkflowState(card)
+  const status = legacyStatusForWorkflowState(state)
+  if (card.lane != null && !isValidLane(card.lane)) {
+    throw new Error(`Invalid execution lane: ${card.lane}`)
+  }
   const maxRow = db.prepare(
     'SELECT MAX(sort_order) as m FROM kanban_cards WHERE status = ? AND archived_at IS NULL'
   ).get(status) as { m: number | null }
   const sortOrder = (maxRow?.m ?? -1) + 1
 
   db.prepare(
-    `INSERT INTO kanban_cards (id, title, description, status, assignee, priority, project, parent_id, due_date, sort_order, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO kanban_cards (id, title, description, status, workflow_state, repair_attempts, assignee, priority, project, parent_id, due_date, sort_order, created_at, updated_at, lane)
+     VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
-    card.id, card.title, card.description ?? null, status,
+    card.id, card.title, card.description ?? null, status, state,
     card.assignee ?? null, card.priority ?? 'normal',
-    card.project ?? null, card.parent_id ?? null, card.due_date ?? null, sortOrder, now, now
+    card.project ?? null, card.parent_id ?? null, card.due_date ?? null, sortOrder, now, now, card.lane ?? null
   )
 }
 
 export function updateKanbanCard(id: string, fields: Partial<Omit<KanbanCard, 'id' | 'created_at'>>): boolean {
   const card = getKanbanCard(id)
   if (!card) return false
+  if (fields.status !== undefined || fields.state !== undefined || fields.workflow_state !== undefined || fields.repair_attempts !== undefined) return false
+  if (card.status === 'in_progress' && fields.lane !== undefined && fields.lane !== null && fields.lane !== card.lane) return false
+  if (fields.lane !== undefined && fields.lane !== null && !isValidLane(fields.lane)) return false
   const now = Math.floor(Date.now() / 1000)
-  const f = { ...card, ...fields, updated_at: now }
+  // A serialized optional null is omission, never permission to erase a
+  // previously assigned execution lane.
+  const normalized = fields.lane === null ? { ...fields, lane: card.lane } : fields
+  const f = { ...card, ...normalized, updated_at: now }
   return db.prepare(
-    `UPDATE kanban_cards SET title=?, description=?, status=?, assignee=?, priority=?, project=?, parent_id=?, due_date=?, sort_order=?, updated_at=?, archived_at=?
+    `UPDATE kanban_cards SET title=?, description=?, status=?, assignee=?, priority=?, project=?, parent_id=?, due_date=?, sort_order=?, updated_at=?, archived_at=?, lane=?
      WHERE id=?`
-  ).run(f.title, f.description, f.status, f.assignee, f.priority, f.project, f.parent_id, f.due_date, f.sort_order, f.updated_at, f.archived_at, id).changes > 0
+  ).run(f.title, f.description, f.status, f.assignee, f.priority, f.project, f.parent_id, f.due_date, f.sort_order, f.updated_at, f.archived_at, f.lane, id).changes > 0
 }
 
 export function getChildCards(parentId: string): KanbanCard[] {
-  return db.prepare('SELECT * FROM kanban_cards WHERE parent_id = ? AND archived_at IS NULL ORDER BY sort_order ASC').all(parentId) as KanbanCard[]
+  return (db.prepare('SELECT * FROM kanban_cards WHERE parent_id = ? AND archived_at IS NULL ORDER BY sort_order ASC').all(parentId) as Array<Omit<KanbanCard, 'state'>>).map(hydrateKanbanCard)
 }
 
-export function moveKanbanCard(id: string, status: KanbanCard['status'], sortOrder: number, actor?: string): boolean {
-  const now = Math.floor(Date.now() / 1000)
-  // Read the previous status first so we only record an audit event on a real
-  // status transition (not a pure sort_order reorder within the same column).
-  const prev = (db.prepare('SELECT status FROM kanban_cards WHERE id=?').get(id) as { status: string } | undefined)?.status
-  const changed = db.prepare(
-    'UPDATE kanban_cards SET status=?, sort_order=?, updated_at=? WHERE id=?'
-  ).run(status, sortOrder, now, id).changes > 0
-  if (changed && prev !== undefined && prev !== status) {
-    db.prepare(
-      'INSERT INTO kanban_card_events (card_id, from_status, to_status, actor, created_at) VALUES (?, ?, ?, ?, ?)'
-    ).run(id, prev, status, actor ?? null, now)
+// `lane` is only meaningful (and only ever passed) when a card enters
+// in_progress with an explicit §23-24 execution lane -- omit it (undefined,
+// the default) to leave the card's existing lane untouched on every other
+// move. This is what keeps lane-tagging opt-in and JIT (§31): a card is only
+// ever lane-tagged the moment it starts running under the new policy, never
+// retroactively.
+export function moveKanbanCard(id: string, status: KanbanCard['status'], sortOrder: number, actor?: string, lane?: string | null): boolean {
+  const existing = getKanbanCard(id)
+  if (!existing) return false
+  const requestedState = workflowStateFromLegacyStatus(status)
+  if (requestedState === existing.state) {
+    if (lane !== undefined && lane !== null && lane !== existing.lane) return false
+    const now = Math.floor(Date.now() / 1000)
+    return db.prepare('UPDATE kanban_cards SET sort_order=?, updated_at=? WHERE id=?').run(sortOrder, now, id).changes > 0
   }
-  return changed
+  if (requestedState === 'running') return false
+  if (existing.status === 'in_progress' && lane !== undefined && lane !== null && lane !== existing.lane) return false
+  if (lane !== undefined && lane !== null && !isValidLane(lane)) return false
+  return transitionKanbanWorkflowState(id, requestedState, sortOrder, actor, lane).changed
+}
+
+// §23-24 One Piece Flow: how many OTHER non-archived cards are already
+// in_progress in this lane. Only lane-tagged cards are counted -- the
+// pre-governance backlog (lane=NULL) is structurally invisible here, so it
+// can never block new lane-tagged work (§29/§31, no bulk migration).
+export function countInProgressInLane(lane: string, excludeId?: string): number {
+  const row = excludeId === undefined
+    ? db.prepare(
+      "SELECT COUNT(*) AS n FROM kanban_cards WHERE status='in_progress' AND archived_at IS NULL AND lane=?"
+    ).get(lane)
+    : db.prepare(
+      "SELECT COUNT(*) AS n FROM kanban_cards WHERE status='in_progress' AND archived_at IS NULL AND lane=? AND (id IS NULL OR id != ?)"
+    ).get(lane, excludeId)
+  return (row as { n: number }).n
+}
+
+export interface LaneWipGateResult {
+  lane: string
+  runningCount: number
+  limit: number
+  allowed: boolean
+}
+
+type LanePolicy = { limit: number; enforce: boolean }
+function lanePolicy(lane: string, override?: LanePolicy): LanePolicy {
+  if (override) return override
+  const row = db.prepare('SELECT limit_value, enforce FROM kanban_lane_policy WHERE lane=?').get(lane) as { limit_value: number; enforce: number }
+  return { limit: row.limit_value, enforce: row.enforce === 1 }
+}
+type LaneTransitionGate = { laneGate?: LaneWipGateResult; laneRequired?: true; enforce?: boolean }
+
+// Shared by /move and PUT while each caller's DB transaction is active. Null
+// is normalized to omission here once, so the two public write paths cannot
+// drift on lane-required, stored-lane fallback, or WIP counting semantics.
+function evaluateLaneTransition(
+  id: string,
+  existing: { status: string; lane: string | null; archived_at: number | null },
+  requestedStatus: string,
+  suppliedLane: string | null | undefined,
+  opts: LanePolicy | undefined,
+  archivedAt = existing.archived_at,
+): LaneTransitionGate {
+  const requestedLane = suppliedLane ?? undefined
+  const startsRunning = requestedStatus === 'in_progress' && existing.status !== 'in_progress'
+  const changesRunningLane = requestedStatus === 'in_progress' && requestedLane !== undefined && requestedLane !== existing.lane
+  const restoresRunning = requestedStatus === 'in_progress' && existing.archived_at !== null && archivedAt === null
+  if (!startsRunning && !changesRunningLane && !restoresRunning) return {}
+
+  const effectiveLane = requestedLane ?? existing.lane
+  if (!effectiveLane) return startsRunning ? { laneRequired: true } : {}
+  if (archivedAt !== null) return {}
+  const policy = lanePolicy(effectiveLane, opts)
+  const runningCount = (db.prepare(
+    "SELECT COUNT(*) AS n FROM kanban_cards WHERE status='in_progress' AND archived_at IS NULL AND lane=? AND (id IS NULL OR id != ?)"
+  ).get(effectiveLane, id) as { n: number }).n
+  const allowed = policy.limit <= 0 || runningCount < policy.limit
+  return { laneGate: { lane: effectiveLane, runningCount, limit: policy.limit, allowed }, enforce: policy.enforce }
+}
+
+export type WorkflowTransitionResult = {
+  changed: boolean
+  state?: WorkflowState
+  reason?: 'invalid_transition' | 'repair_limit_exhausted'
+  laneGate?: LaneWipGateResult
+  laneRequired?: true
+  correlationId?: string
+  observationEventId?: string
+}
+
+/** The canonical, transactional state-change authority for TASK-0019. */
+export function transitionKanbanWorkflowState(
+  id: string,
+  requestedState: WorkflowState,
+  sortOrder: number,
+  actor?: string,
+  lane?: string | null,
+  opts?: LanePolicy,
+  observation?: { correlationId?: string; sessionId?: string | null },
+): WorkflowTransitionResult {
+  const tx = db.transaction((): WorkflowTransitionResult => {
+    const existing = db.prepare(
+      'SELECT status, workflow_state, repair_attempts, lane, archived_at FROM kanban_cards WHERE id=?'
+    ).get(id) as { status: KanbanCard['status']; workflow_state: WorkflowState | null; repair_attempts: number; lane: string | null; archived_at: number | null } | undefined
+    if (!existing) return { changed: false }
+    const fromState = existing.workflow_state ?? workflowStateFromLegacyStatus(existing.status)
+    if (requestedState === fromState) {
+      if (lane !== undefined && lane !== null && lane !== existing.lane) return { changed: false, state: fromState, reason: 'invalid_transition' }
+      const now = Math.floor(Date.now() / 1000)
+      db.prepare('UPDATE kanban_cards SET sort_order=?,updated_at=? WHERE id=?').run(sortOrder, now, id)
+      return { changed: true, state: fromState }
+    }
+    const decision = decideWorkflowTransition(fromState, requestedState, existing.repair_attempts)
+    if (!decision.allowed) return { changed: false, state: fromState, reason: decision.reason }
+    const toStatus = legacyStatusForWorkflowState(decision.state)
+    const gate = evaluateLaneTransition(id, existing, toStatus, lane, opts)
+    if (gate.laneRequired) return { changed: false, laneRequired: true }
+    if (gate.laneGate && !gate.laneGate.allowed && gate.enforce) {
+      return { changed: false, state: fromState, laneGate: gate.laneGate }
+    }
+    const occurredAtMs = Date.now()
+    const now = Math.floor(occurredAtMs / 1000)
+    const effectiveLane = lane ?? existing.lane
+    const correlationId = observation?.correlationId ?? randomUUID()
+    const observationEventId = randomUUID()
+    db.prepare(`UPDATE kanban_cards
+      SET workflow_state=?, status=?, repair_attempts=?, sort_order=?, updated_at=?, lane=? WHERE id=?`)
+      .run(decision.state, toStatus, decision.repairAttempts, sortOrder, now, effectiveLane, id)
+    db.prepare(`INSERT INTO kanban_card_events
+      (card_id,from_status,to_status,actor,created_at,from_state,to_state,reason,correlation_id,observation_event_id)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`).run(
+      id, existing.status, toStatus, actor ?? null, now, fromState, decision.state, decision.reason ?? null,
+      correlationId, observationEventId,
+    )
+    const transitionSequence = (db.prepare(
+      "SELECT COALESCE(MAX(transition_sequence), 0) + 1 AS n FROM task_observability_events WHERE kind='workflow_transition' AND task_id=?"
+    ).get(id) as { n: number }).n
+    appendTaskObservation(db, {
+      eventId: observationEventId, correlationId,
+      kind: 'workflow_transition', taskId: id, sessionId: observation?.sessionId,
+      provenance: 'TASK-0019.workflow.v1',
+      occurredAtMs, transitionSequence,
+      metadata: { from_state: fromState, to_state: decision.state, repair_attempts: decision.repairAttempts },
+    })
+    return { changed: true, state: decision.state, reason: decision.reason, laneGate: gate.laneGate,
+      correlationId, observationEventId }
+  })
+  return tx.immediate()
+}
+
+// §23-24 lane-WIP gate, made atomic (TASK-0018 review blocker #3 + #2).
+//
+// #3 -- the count-then-write used to be two separate statements a caller
+// issued back to back; nothing at the DB layer stopped a second request from
+// reading the same "not yet full" count before the first request's write
+// landed. better-sqlite3 already serializes every synchronous call on this
+// one connection/process (see `moveKanbanCard` above, unchanged and still
+// used by every non-gated caller), so in the current single-process
+// deployment this could not actually interleave -- but correctness should
+// not rest on "and nobody ever adds an await in between" or "and this stays
+// one process forever". Wrapping count+decide+write in a single
+// db.transaction() makes the guarantee structural instead of incidental.
+//
+// #2 -- if the caller omits `lane` (undefined), the gate does not just skip
+// itself: it falls back to the card's already-stored lane. That closes the
+// re-entry bypass the review flagged (done|waiting -> in_progress without
+// resending lane used to silently exit the gate for a card the system had
+// already tagged).
+export function moveKanbanCardWithLaneGate(
+  id: string,
+  status: KanbanCard['status'],
+  sortOrder: number,
+  actor: string | undefined,
+  lane: string | null | undefined,
+  opts?: LanePolicy
+): { changed: boolean; laneGate?: LaneWipGateResult; laneRequired?: true } {
+  const existing = getKanbanCard(id)
+  if (!existing) return { changed: false }
+  const requestedState = workflowStateFromLegacyStatus(status)
+  if (requestedState === existing.state) {
+    if (lane !== undefined && lane !== null && lane !== existing.lane) return { changed: false }
+    const gate = evaluateLaneTransition(id, existing, status, lane, opts)
+    if (gate.laneRequired) return { changed: false, laneRequired: true }
+    if (gate.laneGate && !gate.laneGate.allowed && gate.enforce) return { changed: false, laneGate: gate.laneGate }
+    const now = Math.floor(Date.now() / 1000)
+    const effectiveLane = lane ?? existing.lane
+    const changed = db.prepare('UPDATE kanban_cards SET sort_order=?,updated_at=?,lane=? WHERE id=?').run(sortOrder, now, effectiveLane, id).changes > 0
+    return { changed, laneGate: gate.laneGate }
+  }
+  return transitionKanbanWorkflowState(id, requestedState, sortOrder, actor, lane, opts)
+}
+
+// Same atomicity + re-entry-fallback guarantee as moveKanbanCardWithLaneGate,
+// for the generic PUT /api/kanban/:id path (TASK-0018 review blocker #4: a
+// direct PUT with status:'in_progress' used to bypass the gate entirely
+// because only the /move route checked it). Only status/lane changes trigger
+// the gate; every other field update behaves exactly like updateKanbanCard.
+export function updateKanbanCardWithLaneGate(
+  id: string,
+  fields: Partial<Omit<KanbanCard, 'id' | 'created_at'>>,
+  opts?: LanePolicy
+): { updated: boolean; laneGate?: LaneWipGateResult; laneRequired?: true } {
+  const tx = db.transaction((): { updated: boolean; laneGate?: LaneWipGateResult; laneRequired?: true } => {
+    const card = db.prepare('SELECT rowid AS seq, * FROM kanban_cards WHERE id = ?').get(id) as KanbanCard | undefined
+    if (!card) return { updated: false }
+    if (fields.status !== undefined || fields.state !== undefined || fields.workflow_state !== undefined || fields.repair_attempts !== undefined) return { updated: false }
+    // Null is never destructive for lane: API clients commonly serialize
+    // optional fields as null, and allowing that to clear a stored lane would
+    // recreate the bypass on the next transition.
+    const { lane: suppliedLane, ...otherFields } = fields
+    const requestedLane = suppliedLane ?? undefined
+    const normalizedFields = requestedLane === undefined ? otherFields : { ...otherFields, lane: requestedLane }
+    const requestedStatus = normalizedFields.status ?? card.status
+    const gate = evaluateLaneTransition(id, card, requestedStatus, suppliedLane, opts, fields.archived_at === undefined ? card.archived_at : fields.archived_at)
+    if (gate.laneRequired) return { updated: false, laneRequired: true }
+    const laneGate = gate.laneGate
+    if (laneGate && !laneGate.allowed && gate.enforce) return { updated: false, laneGate }
+    const now = Math.floor(Date.now() / 1000)
+    const f = { ...card, ...normalizedFields, updated_at: now }
+    const changes = db.prepare(
+      `UPDATE kanban_cards SET title=?, description=?, status=?, assignee=?, priority=?, project=?, parent_id=?, due_date=?, sort_order=?, updated_at=?, archived_at=?, lane=?
+       WHERE id=?`
+    ).run(f.title, f.description, f.status, f.assignee, f.priority, f.project, f.parent_id, f.due_date, f.sort_order, f.updated_at, f.archived_at, f.lane, id).changes
+    return { updated: changes > 0, laneGate }
+  })
+  return tx.immediate()
+}
+
+export function createKanbanCardWithLaneGate(
+  card: Parameters<typeof createKanbanCard>[0],
+  opts: { limit: number; enforce: boolean },
+): { created: boolean; laneGate?: LaneWipGateResult; laneRequired?: true } {
+  const tx = db.transaction(() => {
+    createKanbanCard(card)
+    return { created: true }
+  })
+  return tx.immediate()
+}
+
+/** Fleet restore only: preserve snapshot state, including old lane-less rows.
+ * The flag exists ONLY inside this write transaction/savepoint. Other WAL
+ * readers cannot see it, and SQLite's single writer lock prevents competing
+ * inserts until it has been deleted. Failure rolls back the flag as well as
+ * the insert, even when the caller catches the error in an outer transaction.
+ * This is an integrity guard for trusted writers, not a SQLite privilege boundary.
+ */
+export function insertImportedKanbanCard(c: Record<string, any>): void {
+  if (c.lane != null && !isValidLane(c.lane)) throw new Error(`Invalid execution lane: ${c.lane}`)
+  const importedState = c.workflow_state ?? c.state
+  if (importedState !== undefined && (!isWorkflowState(importedState) ||
+      !isWorkflowStateCompatibleWithLegacyStatus(importedState, c.status))) {
+    throw new Error('Conflicting workflow state and legacy status in fleet snapshot')
+  }
+  db.transaction(() => {
+    db.prepare("INSERT INTO kanban_runtime_flags (key,value) VALUES ('legacy_import',1)").run()
+    db.prepare(`INSERT INTO kanban_cards
+      (id,title,description,status,workflow_state,repair_attempts,assignee,priority,project,due_date,sort_order,created_at,updated_at,archived_at,parent_id,dispatched_at,lane)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`).run(c.id, c.title, c.description ?? null, c.status,
+        importedState ?? null, c.repair_attempts ?? 0,
+        c.assignee ?? null, c.priority, c.project ?? null, c.due_date ?? null, c.sort_order,
+        c.created_at, c.updated_at, c.archived_at ?? null, c.parent_id ?? null, c.dispatched_at ?? null, c.lane ?? null)
+    db.prepare("DELETE FROM kanban_runtime_flags WHERE key='legacy_import'").run()
+  }).immediate()
 }
 
 // Stamp the once-only kanban -> agent dispatch guard. Returns false if the
@@ -1842,10 +2301,30 @@ export function unarchiveKanbanCard(id: string): boolean {
   return db.prepare('UPDATE kanban_cards SET archived_at=NULL, updated_at=? WHERE id=? AND archived_at IS NOT NULL').run(now, id).changes > 0
 }
 
+export function unarchiveKanbanCardWithLaneGate(id: string, opts: { limit: number; enforce: boolean }): { unarchived: boolean; laneGate?: LaneWipGateResult } {
+  const tx = db.transaction(() => {
+    const card = getKanbanCard(id)
+    if (!card || card.archived_at === null) return { unarchived: false }
+    let laneGate: LaneWipGateResult | undefined
+    if (card.status === 'in_progress' && card.lane) {
+      const runningCount = countInProgressInLane(card.lane, id)
+      laneGate = { lane: card.lane, runningCount, limit: opts.limit, allowed: opts.limit <= 0 || runningCount < opts.limit }
+      if (!laneGate.allowed && opts.enforce) return { unarchived: false, laneGate }
+    }
+    const now = Math.floor(Date.now() / 1000)
+    const unarchived = db.prepare('UPDATE kanban_cards SET archived_at=NULL, updated_at=? WHERE id=? AND archived_at IS NOT NULL').run(now, id).changes > 0
+    return { unarchived, laneGate }
+  })
+  return tx.immediate()
+}
+
 export interface ArchivedKanbanCard {
   id: string
   title: string
   status: string
+  workflow_state: WorkflowState
+  state: WorkflowState
+  repair_attempts: number
   project: string | null
   priority: string
   assignee: string | null
@@ -1863,7 +2342,8 @@ export function listArchivedKanbanCards(opts: {
 }): ArchivedKanbanCard[] {
   const { q, project, label, from, to, limit } = opts
   let sql = `
-    SELECT DISTINCT kc.id, kc.title, kc.status, kc.project, kc.priority, kc.assignee, kc.archived_at, kc.updated_at
+    SELECT DISTINCT kc.id, kc.title, kc.status, kc.workflow_state, kc.workflow_state AS state,
+      kc.repair_attempts, kc.project, kc.priority, kc.assignee, kc.archived_at, kc.updated_at
     FROM kanban_cards kc
   `
   const params: unknown[] = []
@@ -1885,7 +2365,14 @@ export function listArchivedKanbanCards(opts: {
   }
   sql += ' ORDER BY kc.archived_at DESC LIMIT ?'
   params.push(limit)
-  return db.prepare(sql).all(...params) as ArchivedKanbanCard[]
+  const rows = db.prepare(sql).all(...params) as Array<ArchivedKanbanCard & { workflow_state: WorkflowState | null; state: WorkflowState | null }>
+  return rows.map(card => {
+    const status = card.status as KanbanCard['status']
+    const state = card.workflow_state && isWorkflowStateCompatibleWithLegacyStatus(card.workflow_state, status)
+      ? card.workflow_state
+      : workflowStateFromLegacyStatus(status)
+    return { ...card, workflow_state: state, state }
+  })
 }
 
 export function listKanbanProjects(): string[] {
@@ -1927,6 +2414,11 @@ export interface KanbanCardEvent {
   from_status: string | null
   to_status: string
   actor: string | null
+  from_state: WorkflowState | null
+  to_state: WorkflowState | null
+  reason: string | null
+  correlation_id: string | null
+  observation_event_id: string | null
   created_at: number
 }
 
@@ -1951,9 +2443,10 @@ export function getKanbanSeqByIdPrefix(prefix: string): number | null {
 // Find an active (non-archived) kanban card by exact title match, or
 // undefined when none exists.
 export function findActiveKanbanCardByTitle(title: string): KanbanCard | undefined {
-  return db.prepare(
+  const card = db.prepare(
     'SELECT rowid AS seq, * FROM kanban_cards WHERE title = ? AND archived_at IS NULL LIMIT 1'
-  ).get(title) as KanbanCard | undefined
+  ).get(title) as Omit<KanbanCard, 'state'> | undefined
+  return card ? hydrateKanbanCard(card) : undefined
 }
 
 // Move the first active kanban card whose title equals `taskName` to the
@@ -1968,8 +2461,10 @@ export function markScheduledTaskKanbanWaiting(taskName: string): string | null 
     "SELECT MAX(sort_order) as m FROM kanban_cards WHERE status = 'waiting' AND archived_at IS NULL"
   ).get() as { m: number | null }
   const sortOrder = (maxResult.m ?? 0) + 100
-  moveKanbanCard(card.id, 'waiting', sortOrder, 'scheduler')
-  return card.id
+  const result = card.state === 'blocked'
+    ? moveKanbanCard(card.id, 'waiting', sortOrder, 'scheduler')
+    : transitionKanbanWorkflowState(card.id, 'blocked', sortOrder, 'scheduler').changed
+  return result ? card.id : null
 }
 
 export function addKanbanComment(cardId: string, author: string, content: string): KanbanComment {
@@ -2526,6 +3021,35 @@ export function appendTaskRun(name: string, agent: string, status = 'fired'): vo
   db.prepare('INSERT INTO task_runs (name, agent, ts, status) VALUES (?, ?, ?, ?)').run(name, agent, now, status)
   // Opportunistic TTL prune: cheap indexed DELETE, keeps the table bounded.
   db.prepare('DELETE FROM task_runs WHERE ts < ?').run(now - TASK_RUN_TTL_MS)
+}
+
+export interface TaskOutputObligationRow {
+  task_name: string; agent_name: string; injected_at: number; session: string
+  host: string | null; working_dir: string; config_dir: string | null
+  timeout_ms: number; output_path: string; output_fingerprint: string | null
+}
+export interface NewTaskOutputObligation {
+  taskName: string; agentName: string; injectedAt: number; session: string
+  host: string | null; workingDir: string; configDir?: string; timeoutMs: number
+  outputPath: string; outputFingerprint: string | null
+}
+export function persistTaskOutputObligation(o: NewTaskOutputObligation): void {
+  db.transaction(() => {
+    db.prepare(`INSERT INTO task_output_obligations
+      (task_name,agent_name,injected_at,session,host,working_dir,config_dir,timeout_ms,output_path,output_fingerprint)
+      VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(task_name,agent_name) DO UPDATE SET
+      injected_at=excluded.injected_at,session=excluded.session,host=excluded.host,
+      working_dir=excluded.working_dir,config_dir=excluded.config_dir,timeout_ms=excluded.timeout_ms,
+      output_path=excluded.output_path,output_fingerprint=excluded.output_fingerprint`)
+      .run(o.taskName,o.agentName,o.injectedAt,o.session,o.host,o.workingDir,o.configDir ?? null,o.timeoutMs,o.outputPath,o.outputFingerprint)
+  })()
+}
+export function listTaskOutputObligations(): TaskOutputObligationRow[] {
+  return db.prepare('SELECT * FROM task_output_obligations ORDER BY injected_at ASC').all() as TaskOutputObligationRow[]
+}
+export function deleteTaskOutputObligation(taskName: string, agentName: string, injectedAt: number): boolean {
+  return db.prepare('DELETE FROM task_output_obligations WHERE task_name=? AND agent_name=? AND injected_at=?')
+    .run(taskName, agentName, injectedAt).changes > 0
 }
 
 export function listTaskRunHistory(name: string, limit: number): TaskRunHistoryEntry[] {
@@ -3598,4 +4122,3 @@ export function listOtelTraces(limit = 50): OtelTraceSummary[] {
     LIMIT ?
   `).all(limit) as OtelTraceSummary[]
 }
-

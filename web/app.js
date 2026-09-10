@@ -572,13 +572,12 @@ function renderStaticI18n() {
   }
   // Kanban column titles
   const colTitles = document.querySelectorAll('.kanban-col-title')
-  const statusKeys = ['kanban.col.planned', 'kanban.col.in_progress', 'kanban.col.waiting', 'kanban.col.testing', 'kanban.col.done']
-  const statuses = ['planned', 'in_progress', 'waiting', 'testing', 'done']
+  const statuses = ['new', 'ready', 'running', 'verify', 'repair', 'blocked', 'done']
   colTitles.forEach((el) => {
     const status = el.closest('[data-status]')?.dataset?.status
     if (status) {
       const idx = statuses.indexOf(status)
-      if (idx !== -1) el.textContent = t(statusKeys[idx])
+      if (idx !== -1) el.textContent = t(`kanban.col.${statuses[idx]}`)
     }
   })
   // Docs hints
@@ -898,7 +897,7 @@ async function loadKanban() {
       fetch('/api/kanban-projects'),
       fetch('/api/kanban/labels'),
     ])
-    kanbanCards = await cardsRes.json()
+    kanbanCards = (await cardsRes.json()).map(card => ({ ...card, state: kanbanWorkflowState(card) }))
     kanbanAssignees = await assigneesRes.json()
     kanbanProjects = await projectsRes.json()
     kanbanAllLabels = await labelsRes.json()
@@ -1147,21 +1146,23 @@ function renderKanban() {
     if (!card.parent_id) continue
     const parent = cardById.get(card.parent_id)
     if (!parent || !visibleCardIds.has(parent.id)) continue
-    if (parent.status === card.status) embeddedSubtaskIds.add(card.id)
+    if (kanbanWorkflowState(parent) === kanbanWorkflowState(card)) embeddedSubtaskIds.add(card.id)
   }
 
-  const grouped = { planned: [], in_progress: [], waiting: [], testing: [], done: [] }
+  const grouped = { new: [], ready: [], running: [], verify: [], repair: [], blocked: [], done: [] }
   for (const card of kanbanCards) {
     if (embeddedSubtaskIds.has(card.id)) continue
     if (!visibleCardIds.has(card.id)) continue
-    if (grouped[card.status]) grouped[card.status].push(card)
+    if (grouped[kanbanWorkflowState(card)]) grouped[kanbanWorkflowState(card)].push(card)
   }
 
   // Update counts (embedded subtasks don't count as separate cards)
-  document.getElementById('countPlanned').textContent = grouped.planned.length
-  document.getElementById('countInProgress').textContent = grouped.in_progress.length
-  document.getElementById('countTesting').textContent = grouped.testing.length
-  document.getElementById('countWaiting').textContent = grouped.waiting.length
+  document.getElementById('countNew').textContent = grouped.new.length
+  document.getElementById('countReady').textContent = grouped.ready.length
+  document.getElementById('countRunning').textContent = grouped.running.length
+  document.getElementById('countVerify').textContent = grouped.verify.length
+  document.getElementById('countRepair').textContent = grouped.repair.length
+  document.getElementById('countBlocked').textContent = grouped.blocked.length
   document.getElementById('countDone').textContent = grouped.done.length
 
   const flatBoard = document.getElementById('kanbanBoard')
@@ -1215,12 +1216,22 @@ function renderKanban() {
 }
 
 const KANBAN_STATUS_DEFS = [
-  { status: 'planned', title: () => t('kanban.col.planned') },
-  { status: 'in_progress', title: () => t('kanban.col.in_progress') },
-  { status: 'waiting', title: () => t('kanban.col.waiting') },
-  { status: 'testing', title: () => t('kanban.col.testing') },
+  { status: 'new', title: () => t('kanban.col.new') },
+  { status: 'ready', title: () => t('kanban.col.ready') },
+  { status: 'running', title: () => t('kanban.col.running') },
+  { status: 'verify', title: () => t('kanban.col.verify') },
+  { status: 'repair', title: () => t('kanban.col.repair') },
+  { status: 'blocked', title: () => t('kanban.col.blocked') },
   { status: 'done', title: () => t('kanban.col.done') },
 ]
+const KANBAN_WORKFLOW_EDGES = {
+  new: ['ready', 'blocked'], ready: ['running', 'blocked'], running: ['verify', 'blocked'],
+  verify: ['done', 'repair', 'blocked'], repair: ['verify', 'blocked'], blocked: ['ready'], done: [],
+}
+function kanbanWorkflowState(card) {
+  if (card?.state || card?.workflow_state) return card.state || card.workflow_state
+  return ({ planned: 'ready', in_progress: 'running', testing: 'verify', waiting: 'blocked', done: 'done' })[card?.status] || 'ready'
+}
 const KANBAN_PRIORITY_LABELS = { urgent: () => t('kanban.priority.urgent'), high: () => t('kanban.priority.high'), normal: () => t('kanban.priority.normal'), low: () => t('kanban.priority.low') }
 const KANBAN_PRIORITY_ORDER = ['urgent', 'high', 'normal', 'low']
 
@@ -1338,10 +1349,8 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
 
 // Map column status keys to their count-span IDs
 const WIP_COUNT_IDS = {
-  planned: 'countPlanned',
-  in_progress: 'countInProgress',
-  testing: 'countTesting',
-  waiting: 'countWaiting',
+  new: 'countNew', ready: 'countReady', running: 'countRunning',
+  verify: 'countVerify', repair: 'countRepair', blocked: 'countBlocked',
   done: 'countDone',
 }
 
@@ -1558,6 +1567,58 @@ function createCardEl(card, embeddedChildren = []) {
 // backend dispatches as it always did, never the opposite.
 function kanbanMoveActor() { return window._marveen?.ownerName || undefined }
 
+const KANBAN_EXECUTION_LANES = ['DEVELOPMENT', 'EMAIL', 'CALENDAR', 'MONITORING', 'MAINTENANCE', 'ADMIN']
+
+// Preserve legacy lane=NULL cards in place, but migrate them JIT when the user
+// actually starts them. Returning null means "cancel/block this move";
+// undefined is valid for moves that do not enter in_progress.
+function chooseLaneForMove(card, newStatus) {
+  if (!card || newStatus !== 'running' || kanbanWorkflowState(card) === 'running') return card?.lane || undefined
+  if (card.lane && KANBAN_EXECUTION_LANES.includes(card.lane)) return card.lane
+  const answer = window.prompt(
+    `Válassz execution lane-t az indításhoz:\n${KANBAN_EXECUTION_LANES.join(', ')}`,
+    'DEVELOPMENT',
+  )
+  if (answer === null) return null
+  const chosen = answer.trim().toUpperCase()
+  if (!KANBAN_EXECUTION_LANES.includes(chosen)) {
+    showToast(`Érvénytelen execution lane. Válassz ezek közül: ${KANBAN_EXECUTION_LANES.join(', ')}`)
+    return null
+  }
+  return chosen
+}
+
+// One authoritative browser path for desktop DnD. dragover moves the DOM card
+// optimistically, so every non-success path reloads the board to restore the
+// server-authoritative position.
+async function submitKanbanMove(card, newStatus, sortOrder) {
+  const current = kanbanWorkflowState(card)
+  if (newStatus !== current && !(KANBAN_WORKFLOW_EDGES[current] || []).includes(newStatus)) {
+    showToast(t('kanban.toast.move_error'))
+    await loadKanban()
+    return false
+  }
+  const resolvedLane = chooseLaneForMove(card, newStatus)
+  if (resolvedLane === null) {
+    await loadKanban()
+    return false
+  }
+  try {
+    const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/move`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state: newStatus, sort_order: sortOrder, actor: kanbanMoveActor(), lane: resolvedLane }),
+    })
+    if (!r.ok) throw new Error('move failed')
+    await loadKanban()
+    return true
+  } catch {
+    showToast(t('kanban.toast.move_error'))
+    await loadKanban()
+    return false
+  }
+}
+
 // === Drag & Drop ===
 // Wires the drag/drop handlers for one column-body element. Used for the
 // 4 static flat-board columns at load time, and again for every swimlane
@@ -1595,16 +1656,9 @@ function wireKanbanColumnDnD(col) {
     const idx = cards.findIndex((c) => c.dataset.id === cardId)
     let sortOrder = idx
 
-    try {
-      await fetch(`/api/kanban/${encodeURIComponent(cardId)}/move`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: newStatus, sort_order: sortOrder, actor: kanbanMoveActor() }),
-      })
-      loadKanban()
-    } catch {
-      showToast(t('kanban.toast.move_error'))
-    }
+    const draggedCard = kanbanCards.find((c) => c.id === cardId)
+    if (!draggedCard) { await loadKanban(); return }
+    await submitKanbanMove(draggedCard, newStatus, sortOrder)
   })
 }
 columns.forEach(wireKanbanColumnDnD)
@@ -1636,12 +1690,13 @@ function kanbanColBodyAt(x, y) {
 // Instead, committing to a drag raises a fixed bar of status targets over the
 // bottom of the screen: the same gesture, with somewhere to drop. Column
 // hit-testing stays active for viewports where the target column IS visible.
-const KANBAN_TOUCH_STATUSES = ['planned', 'in_progress', 'waiting', 'testing', 'done']
+const KANBAN_TOUCH_STATUSES = ['new', 'ready', 'running', 'verify', 'repair', 'blocked', 'done']
 
 function buildTouchDropBar(currentStatus) {
   const bar = document.createElement('div')
   bar.className = 'kanban-touch-dropbar'
-  for (const s of KANBAN_TOUCH_STATUSES) {
+  const allowed = new Set([currentStatus, ...(KANBAN_WORKFLOW_EDGES[currentStatus] || [])])
+  for (const s of KANBAN_TOUCH_STATUSES.filter(state => allowed.has(state))) {
     const chip = document.createElement('div')
     chip.className = 'kanban-drop-target'
     chip.dataset.status = s
@@ -1702,7 +1757,7 @@ function beginTouchDrag(x, y) {
   touchDrag.ghost = ghost
   positionTouchGhost(x, y)
   touchDrag.active = true
-  touchDrag.dropBar = buildTouchDropBar(touchDrag.card.status)
+  touchDrag.dropBar = buildTouchDropBar(kanbanWorkflowState(touchDrag.card))
   el.classList.add('dragging')
   // Confirm the mode switch on devices that support it -- without a cursor,
   // the only other signal that a long press "took" is the ghost appearing.
@@ -1738,6 +1793,7 @@ async function kanbanTouchEnd(e) {
   const chip = kanbanDropTargetAt(p.clientX, p.clientY)
   const col = chip ? null : kanbanColBodyAt(p.clientX, p.clientY)
   const cardId = touchDrag.card.id
+  const movedCard = touchDrag.card
   // The release that ends a drag would otherwise also register as a tap and
   // open the detail modal on top of the board the user just rearranged.
   touchDrag.el.dataset.suppressClick = '1'
@@ -1761,11 +1817,15 @@ async function kanbanTouchEnd(e) {
   // A drop inside a column always posts, even when the status is unchanged --
   // that is a reorder within the column, which is just as valid a move.
   if (!newStatus) return
+  const currentState = kanbanWorkflowState(movedCard)
+  if (newStatus !== currentState && !(KANBAN_WORKFLOW_EDGES[currentState] || []).includes(newStatus)) return
+  const resolvedLane = chooseLaneForMove(movedCard, newStatus)
+  if (resolvedLane === null) return
   try {
     const r = await fetch(`/api/kanban/${encodeURIComponent(cardId)}/move`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: newStatus, sort_order: sortOrder, actor: kanbanMoveActor() }),
+      body: JSON.stringify({ state: newStatus, sort_order: sortOrder, actor: kanbanMoveActor(), lane: resolvedLane }),
     })
     if (!r.ok) throw new Error('move failed')
     loadKanban()
@@ -1826,7 +1886,10 @@ function openNewCardModal(status) {
   document.getElementById('cardProject').value = ''
   document.getElementById('cardDue').value = ''
   document.getElementById('cardEditId').value = ''
-  document.getElementById('cardEditStatus').value = status || 'planned'
+  // Creation is deliberately not a workflow transition. Preserve the READY
+  // backlog shortcut, but every other column's add button starts a NEW card.
+  document.getElementById('cardEditStatus').value = status === 'ready' ? 'ready' : 'new'
+  document.getElementById('cardLane').value = ''
   populateAssigneeSelect('cardAssignee')
   populateProjectSuggestions()
   openModal(cardModalOverlay)
@@ -1856,13 +1919,14 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
     assignee: document.getElementById('cardAssignee').value || null,
     priority: document.getElementById('cardPriority').value,
     project: document.getElementById('cardProject').value.trim() || null,
+    lane: document.getElementById('cardLane').value || null,
     due_date: document.getElementById('cardDue').value
       ? Math.floor(new Date(document.getElementById('cardDue').value).getTime() / 1000)
       : null,
   }
 
   const editId = document.getElementById('cardEditId').value
-
+  const createStatus = document.getElementById('cardEditStatus').value
   try {
     if (editId) {
       const res = await fetch(`/api/kanban/${encodeURIComponent(editId)}`, {
@@ -1873,7 +1937,7 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || res.status) }
       showToast(t('kanban.toast.card_updated'))
     } else {
-      data.status = document.getElementById('cardEditStatus').value
+      data.state = createStatus
       const res = await fetch('/api/kanban', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2003,7 +2067,7 @@ async function showCardDetail(card) {
     : null
   const assigneeDisplay = assignee ? (assignee.displayName || assignee.name) : (rawDetailAssignee || '-- nincs --')
   const priorityLabels = { low: t('kanban.priority.low'), normal: t('kanban.priority.normal'), high: t('kanban.priority.high'), urgent: t('kanban.priority.urgent') }
-  const statusLabels = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), testing: t('kanban.status.testing'), waiting: t('kanban.status.waiting'), done: t('kanban.status.done') }
+  const statusLabels = Object.fromEntries(KANBAN_STATUS_DEFS.map(def => [def.status, def.title()]))
 
   const meta = document.getElementById('cardDetailMeta')
   const idLabel = (card.seq != null ? `#${card.seq} · ` : '') + card.id
@@ -2014,7 +2078,7 @@ async function showCardDetail(card) {
     </div>
     <div class="meta-item">
       <span class="meta-label">${t('kanban.meta.status')}</span>
-      <span class="meta-value meta-value-editable" id="metaStatusValue" data-card-id="${card.id}" title="${t('kanban.meta.edit_tooltip')}">${statusLabels[card.status] || card.status}</span>
+      <span class="meta-value meta-value-editable" id="metaStatusValue" data-card-id="${card.id}" title="${t('kanban.meta.edit_tooltip')}">${statusLabels[kanbanWorkflowState(card)] || kanbanWorkflowState(card)}</span>
     </div>
     <div class="meta-item">
       <span class="meta-label">${t('kanban.meta.assignee')}</span>
@@ -2044,10 +2108,10 @@ async function showCardDetail(card) {
   const statusValueEl = document.getElementById('metaStatusValue')
   statusValueEl.addEventListener('click', () => {
     if (statusValueEl.querySelector('select')) return
-    const current = card.status
+    const current = kanbanWorkflowState(card)
     const sel = document.createElement('select')
     sel.style.cssText = 'padding:2px 6px; border-radius:4px; border:1px solid var(--border); background:var(--bg-card); color:var(--text); font-size:inherit'
-    for (const s of ['planned', 'in_progress', 'waiting', 'testing', 'done']) {
+    for (const s of [current, ...(KANBAN_WORKFLOW_EDGES[current] || [])]) {
       const opt = document.createElement('option')
       opt.value = s
       opt.textContent = statusLabels[s] || s
@@ -2061,14 +2125,17 @@ async function showCardDetail(card) {
     const save = async () => {
       const newVal = sel.value
       if (newVal === current) { restore(current); return }
+      const resolvedLane = chooseLaneForMove(card, newVal)
+      if (resolvedLane === null) return restore(current)
       try {
         const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/move`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: newVal, sort_order: 0, actor: kanbanMoveActor() }),
+          body: JSON.stringify({ state: newVal, sort_order: 0, actor: kanbanMoveActor(), lane: resolvedLane }),
         })
         if (!r.ok) throw new Error('move failed')
-        card.status = newVal
+        card.state = newVal
+        if (newVal === 'running' && resolvedLane) card.lane = resolvedLane
         restore(newVal)
         showToast(t('kanban.toast.status_updated'))
         loadKanban && loadKanban()
@@ -2079,7 +2146,7 @@ async function showCardDetail(card) {
     }
     sel.addEventListener('change', save)
     sel.addEventListener('blur', () => {
-      if (statusValueEl.querySelector('select')) restore(card.status)
+      if (statusValueEl.querySelector('select')) restore(kanbanWorkflowState(card))
     })
   })
 
@@ -2111,7 +2178,7 @@ async function showCardDetail(card) {
         const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...card, assignee: newVal }),
+          body: JSON.stringify({ assignee: newVal }),
         })
         if (!r.ok) throw new Error('PUT failed')
         card.assignee = newVal
@@ -2160,7 +2227,7 @@ async function showCardDetail(card) {
       const label = newParentId ? t('kanban.toast.parent_updated') : t('kanban.toast.parent_unset')
       const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...card, parent_id: newParentId }),
+        body: JSON.stringify({ parent_id: newParentId }),
       })
       if (r.ok) { card.parent_id = newParentId; showToast(label); loadKanban(); showCardDetail(card) }
       else showToast(t('kanban.toast.save_error'))
@@ -2239,6 +2306,7 @@ async function showCardDetail(card) {
       : ''
     document.getElementById('cardEditId').value = card.id
     document.getElementById('cardEditStatus').value = card.status
+    document.getElementById('cardLane').value = card.lane || ''
     populateAssigneeSelect('cardAssignee', card.assignee)
     populateProjectSuggestions()
     openModal(cardModalOverlay)
@@ -2289,7 +2357,7 @@ async function showCardDetail(card) {
         try {
           const r = await fetch('/api/kanban', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title, parent_id: card.id, status: card.status, priority: card.priority, project: card.project || null, assignee: null }),
+            body: JSON.stringify({ title, parent_id: card.id, state: 'new', priority: card.priority, project: card.project || null, assignee: null }),
           })
           if (!r.ok) { showToast(t('kanban.toast.subtask_error')); return }
           showToast(t('kanban.toast.subtask_created'))
@@ -12541,6 +12609,14 @@ document.getElementById('chSlackManifestBtn').addEventListener('click', async ()
 
 let recallInitialized = false
 let recallSortDesc = true
+// TASK-0023 Context Gate canary (2026-09-08): opt a fraction of human-
+// initiated recall text searches into the Qwen relevance filter
+// (src/context-gate.ts) by sending ?gate=true. In-memory only, resets on
+// page reload -- fine for a canary, this is not meant to be exact. Revert:
+// delete this counter and the `if (searchInput) { ... }` gate block in
+// doRecall() below to go back to 100% OFF (the server-side default).
+let recallGateCanaryCount = 0
+const RECALL_GATE_CANARY_EVERY_N = 5
 
 async function loadRecallPage() {
   if (!recallInitialized) {
@@ -12612,6 +12688,12 @@ async function doRecall() {
   }
   if (searchInput) params.set('q', searchInput)
   if (agentInput) params.set('agent', agentInput)
+  // TASK-0023 canary: only text searches exercise the gate server-side
+  // (maybeGateMemories no-ops without a query), so only count/gate those.
+  if (searchInput) {
+    recallGateCanaryCount += 1
+    if (recallGateCanaryCount % RECALL_GATE_CANARY_EVERY_N === 0) params.set('gate', 'true')
+  }
 
   const timeline = document.getElementById('recallTimeline')
   const summary = document.getElementById('recallSummary')
@@ -16199,13 +16281,19 @@ async function openResearchDoc(agent, name) {
 ;(() => {
   let archivedInit = false
 
-  const STATUS_LABELS = {
-    planned:     () => t('kanban.status.planned'),
-    in_progress: () => t('kanban.status.in_progress'),
-    waiting:     () => t('kanban.status.waiting'),
-    done:        () => t('kanban.status.done')
+  const ARCHIVED_STATE_LABELS = {
+    new: () => t('kanban.col.new'), ready: () => t('kanban.col.ready'),
+    running: () => t('kanban.col.running'), verify: () => t('kanban.col.verify'),
+    repair: () => t('kanban.col.repair'), blocked: () => t('kanban.col.blocked'),
+    done: () => t('kanban.col.done')
   }
-  const STATUS_COLORS = { planned: '#6b7280', in_progress: '#3b82f6', waiting: '#f59e0b', done: '#10b981' }
+  const ARCHIVED_STATE_COLORS = {
+    new: '#6b7280', ready: '#64748b', running: '#3b82f6', verify: '#8b5cf6',
+    repair: '#ef4444', blocked: '#f59e0b', done: '#10b981'
+  }
+  function archivedWorkflowState(card) {
+    return card.state || card.workflow_state || ({ planned: 'ready', in_progress: 'running', testing: 'verify', waiting: 'blocked', done: 'done' })[card.status] || 'ready'
+  }
   const PRIORITY_LABELS = {
     low:    () => t('kanban.priority.low'),
     normal: () => t('kanban.priority.normal'),
@@ -16261,7 +16349,7 @@ async function openResearchDoc(agent, name) {
     const idLabel = (card.seq != null ? `#${card.seq} · ` : '') + card.id
     meta.innerHTML = `
       <div class="meta-item"><span class="meta-label">${t('kanban.meta.id')}</span><span class="meta-value" style="font-family:monospace">${esc(idLabel)}</span></div>
-      <div class="meta-item"><span class="meta-label">${t('kanban.meta.status')}</span><span class="meta-value">${STATUS_LABELS[card.status]?.() ?? card.status}</span></div>
+      <div class="meta-item"><span class="meta-label">${t('kanban.meta.status')}</span><span class="meta-value" style="color:${ARCHIVED_STATE_COLORS[archivedWorkflowState(card)]}">${ARCHIVED_STATE_LABELS[archivedWorkflowState(card)]?.() ?? archivedWorkflowState(card)}</span></div>
       <div class="meta-item"><span class="meta-label">${t('kanban.meta.assignee')}</span><span class="meta-value">${card.assignee ? esc(card.assignee) : t('kanban.meta.none')}</span></div>
       <div class="meta-item"><span class="meta-label">${t('kanban.meta.priority')}</span><span class="meta-value">${PRIORITY_LABELS[card.priority]?.() ?? card.priority}</span></div>
       <div class="meta-item"><span class="meta-label">${t('kanban.meta.project')}</span><span class="meta-value">${card.project ? esc(card.project) : t('kanban.meta.none')}</span></div>

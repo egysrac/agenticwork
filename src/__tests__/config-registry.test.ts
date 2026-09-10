@@ -8,9 +8,16 @@ describe('config-registry', () => {
     const kanban = SETTINGS_REGISTRY.filter((s) => s.module === 'kanban')
     // the original v1 kanban WIP keys must all still be present
     expect(kanban.length).toBeGreaterThanOrEqual(9)
-    // kanban WIP settings are user-tunable: never secret, hot-reloadable (no restart)
+    // kanban WIP settings are user-tunable: never secret.
     expect(kanban.every((s) => s.secret === false)).toBe(true)
-    expect(kanban.every((s) => s.requiresRestart === false)).toBe(true)
+    // Hot-reloadable, EXCEPT the lane-WIP keys: those are baked into SQLite
+    // triggers at initDatabase() time (see db.ts kanban_lane_policy migration
+    // and config.ts's "restart-only" note on KANBAN_LANE_WIP_LIMIT_<LANE>),
+    // so they genuinely need a restart to take effect.
+    const restartExempt = new Set(['KANBAN_LANE_WIP_LIMIT', 'KANBAN_LANE_WIP_ENFORCE'])
+    const hotReloadable = kanban.filter((s) => !restartExempt.has(s.key))
+    expect(hotReloadable.every((s) => s.requiresRestart === false)).toBe(true)
+    expect(kanban.filter((s) => restartExempt.has(s.key)).every((s) => s.requiresRestart === true)).toBe(true)
     // registry-wide invariant: the Settings UI must never surface a secret key
     expect(SETTINGS_REGISTRY.every((s) => s.secret === false)).toBe(true)
     expect(getSettingDefinition('KANBAN_WIP_PLANNED')?.module).toBe('kanban')
