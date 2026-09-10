@@ -1,0 +1,86 @@
+# Aktiv governance-policy. §35 Policy versioning.
+# Uj protokoll NEM kulon utasitas, hanem ennek verziozott kiegeszitese (v1.1, v1.2...).
+active_version: "1.0"
+document: governance/JARVIS_MASTER_AGENTIC_OPERATING_MODEL.md
+activated_at: "2026-09-04T15:26:37+02:00"
+activated_by: "Alex kerese (2026-09-04)"
+schema_version: "1.0"
+
+# §67 Rollback: az elozo ismert-jo allapot
+rollback:
+  checkpoint: "/home/alex/governance-checkpoints/20260904-152637"
+  previous_version: null      # v1.0 az elso verziozott policy
+  note: >
+    Elotte a kormanyzas harom kulon helyen elt: skills/marveen-agentic-dev/*.md,
+    PROJECT_MEMORY.md es a 2026-09-01/02-i direktiva. Azok NEM torlodtek.
+
+# §36 Policy Compliance Gate -- a telepites NEM implementacio.
+# Egy kovetelmeny csak akkor "implemented", ha a HAROM egyezik:
+#   declared policy == runtime configuration == observed behavior
+compliance:
+  declared: true              # a dokumentum telepitve
+  runtime_configured: false   # §74 3-5. lepes meg nincs kikenyszeritve
+  observed: false             # nincs meres (§74 6-7. lepes)
+  status: DECLARED_ONLY
+
+# §23-24 One Piece Flow / Execution Lanes -- TASK-0018 (§74 3. lepes).
+lane_wip_23_24:
+  declared: true               # DB-szintu trigger es API gate
+  code_tested: true            # 2026-09-07: 253 relevans teszt + 86 fuggetlen adversarial teszt
+  runtime_configured: true     # ellenorzott patch, build es dashboard restart
+  observed: true               # elo DEVELOPMENT canary: runningCount=1, limit=1, allowed=false, HTTP 200 + wip_warning
+  mode: CANARY_WARN_ONLY        # KANBAN_LANE_WIP_ENFORCE=0
+  status: RUNTIME_ACTIVE
+
+# §7 VERIFY/REPAIR workflow-state machine -- TASK-0019 (§74 4. lepes).
+workflow_state_7:
+  declared: true               # NEW→READY→RUNNING→VERIFY→DONE; VERIFY→REPAIR→VERIFY; BLOCKED
+  code_tested: true            # 286 Kanban+Ideas + 5 Notion sync + 52 integritási review teszt
+  runtime_configured: true     # 2026-09-08: 25-fájlos patch, build és dashboard restart
+  observed: true               # élő API-canary és #290 RUNNING→VERIFY→DONE auditált
+  state_authority: LOCAL_KANBAN # Notion outbound státusztükör; inbound státuszírás tiltva
+  migration: JIT_COMPATIBLE     # legacy workflow_state=NULL sorok változatlanok
+  status: RUNTIME_ACTIVE
+
+# §16 Repair limit -- TASK-0020 (§74 5. lepes).
+repair_limit_16:
+  declared: true               # repair_attempt <= 2: REPAIR; harmadik kérés: BLOCKED
+  code_tested: true            # 46 célzott workflow/migrációs teszt PASS
+  runtime_configured: true     # a TASK-0019 workflow tranzakció részeként aktív
+  observed: true               # harmadik REPAIR → BLOCKED + repair_limit_exhausted
+  status: RUNTIME_ACTIVE
+
+# §39 Metrics foundation -- TASK-0021 (§74 6. lepes).
+metrics_foundation_39:
+  declared: true               # token_usage és task_runs nyersadatból, LLM nélkül
+  code_tested: true            # 32 metrics biztonsági/korrektségi teszt PASS; független review PASS
+  runtime_configured: true     # scripts/aggregate-agent-metrics.ts productionben
+  observed: true               # agent_metrics.jsonl: 2 rekord, token_usage=17022, task_runs=17444
+  data_boundary: EXPLICIT_UNKNOWN # FPY, repair, fájl- és tesztadat nem becsült történetileg
+  status: RUNTIME_ACTIVE
+
+# §40 Historical baseline -- TASK-0022 (§74 7. lepes).
+historical_baseline_40:
+  declared: true               # explicit UTC [start,end) időszak, determinisztikus SQL, nincs historikus FPY-becslés
+  code_tested: true            # 55 baseline+metrics biztonsági/korrektségi teszt PASS; független review PASS
+  runtime_configured: true     # scripts/generate-historical-baseline.ts productionben
+  observed: true               # historical-baseline.v1: token_usage=16836, task_runs=17277
+  data_boundary: EXPLICIT_UNKNOWN # FPY, verified outcome, repair és lead time nincs történetileg rekonstruálva
+  status: RUNTIME_ACTIVE
+
+# §37 Context Gate canary -- TASK-0023 (§74 8. lepes).
+context_gate_canary_37:
+  declared: true               # explicit, hitelesített, fix bemenetű POST canary; normál recall változatlan
+  code_tested: true            # 63 célzott teszt + többszörös független fail-closed review PASS
+  runtime_configured: true     # 2026-09-09: 9-fájlos patch, build és dashboard restart
+  observed: true               # endpoint disabled 404 -> enable+restart -> 1 HTTP 200 qwen_success minta, structured event és metric=1
+  mode: CANARY_ACTIVE           # CONTEXT_GATE_CANARY_ENABLED=1; rollback: 0 + restart
+  status: RUNTIME_ACTIVE
+
+# §41 Before/after comparison -- TASK-0024 (§74 9. lepes).
+before_after_41:
+  declared: true               # csak forrásolt, valódi összehasonlítás; nincs FPY vagy repair becslés
+  observed: true               # 2026-09-09: explicit NINCS_ELÉG_ADAT eredmény elfogadva Alex által
+  result: NO_DATA_ACCEPTED     # task-session kapcsolat és reprezentatív valós Context Gate forgalom hiányzik
+  next_gate: REAL_TRAFFIC_REQUIRED # fokozatos rollout csak pozitív, valós forgalmi mérés után
+  status: DONE_WITH_DOCUMENTED_LIMIT
