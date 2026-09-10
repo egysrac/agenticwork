@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { decideTaskTimeout, resolveStuckTimeoutMs, TASK_FIRE_GRACE_MS, TASK_FIRE_TIMEOUT_MS } from '../web/schedule-runner.js'
+import { computeSessionAmbiguity, decideTaskTimeout, resolveStuckTimeoutMs, TASK_FIRE_GRACE_MS, TASK_FIRE_TIMEOUT_MS } from '../web/schedule-runner.js'
 import type { TaskInflightEntry } from '../web/schedule-runner.js'
 
 // Tests for the post-fire timeout watchdog.
@@ -256,6 +256,104 @@ describe('fix-revert guard: alert case is load-bearing', () => {
     // this assertion would fail: that is the correct behaviour.
     expect(result).toBe('alert')
     expect(result).not.toBe('hold')
+  })
+})
+
+// --- HERMES223C: shared-pane task attribution ---
+//
+// 2026-09-09 21:09:29 (kanban 223c45c8 comment #107): ledger-live-drain and
+// reggeli-napindito both fired their own "possible hang" alert off the SAME
+// busy jarvis-channels pane within seconds of each other. taskInflightMap is
+// keyed by `${task}@${agent}`, not by session, so two tasks sharing one tmux
+// session get two independent entries watching one physical pane -- neither
+// can tell which of them the busy state actually belongs to.
+//
+// Hermes's explicit caution: do not just raise the threshold, that only
+// delays the same misattribution -- handle the attribution with real
+// execution evidence. The evidence used here: a prompt is only injected into
+// a session that read ready at injection time (a busy session gets queued to
+// pending_task_retries instead). So a later injectedAt on the same session is
+// proof the session went ready again after the earlier entry's turn, meaning
+// the earlier ("shadowed") entry can no longer claim credit/blame for a busy
+// pane observed afterward.
+
+describe('computeSessionAmbiguity: identifies shadowed entries on a shared session', () => {
+  it('marks the older entry as shadowed when a newer entry shares its session', () => {
+    const entries: Array<[string, { session: string; injectedAt: number }]> = [
+      ['ledger-live-drain@jarvis', { session: 'jarvis-channels', injectedAt: 1000 }],
+      ['reggeli-napindito@jarvis', { session: 'jarvis-channels', injectedAt: 5000 }],
+    ]
+    const shadowed = computeSessionAmbiguity(entries)
+    expect(shadowed.has('ledger-live-drain@jarvis')).toBe(true)
+    expect(shadowed.has('reggeli-napindito@jarvis')).toBe(false)
+  })
+
+  it('marks nobody shadowed when each task has its own session', () => {
+    const entries: Array<[string, { session: string; injectedAt: number }]> = [
+      ['task-a@jarvis', { session: 'jarvis-channels', injectedAt: 1000 }],
+      ['task-b@jarvis', { session: 'jarvis-worker', injectedAt: 5000 }],
+    ]
+    expect(computeSessionAmbiguity(entries).size).toBe(0)
+  })
+
+  it('marks nobody shadowed for a single entry on its session', () => {
+    const entries: Array<[string, { session: string; injectedAt: number }]> = [
+      ['task-a@jarvis', { session: 'jarvis-channels', injectedAt: 1000 }],
+    ]
+    expect(computeSessionAmbiguity(entries).size).toBe(0)
+  })
+
+  it('with three entries on one session, only the newest keeps the session -- the other two are shadowed', () => {
+    const entries: Array<[string, { session: string; injectedAt: number }]> = [
+      ['a@jarvis', { session: 'jarvis-channels', injectedAt: 1000 }],
+      ['b@jarvis', { session: 'jarvis-channels', injectedAt: 2000 }],
+      ['c@jarvis', { session: 'jarvis-channels', injectedAt: 3000 }],
+    ]
+    const shadowed = computeSessionAmbiguity(entries)
+    expect(shadowed.has('a@jarvis')).toBe(true)
+    expect(shadowed.has('b@jarvis')).toBe(true)
+    expect(shadowed.has('c@jarvis')).toBe(false)
+  })
+})
+
+describe('decideTaskTimeout: sessionShadowed suppresses the busy-alert for the older entry', () => {
+  it('holds instead of alerting when sessionShadowed is true, even past the timeout', () => {
+    const entry = makeEntry({ injectedAt: 0 })
+    const now = TIMEOUT + 1
+    expect(decideTaskTimeout(entry, 'busy', now, { ...BASE_OPTS, sessionShadowed: true })).toBe('hold')
+  })
+
+  it('still alerts normally when sessionShadowed is false (unshared session, unaffected)', () => {
+    const entry = makeEntry({ injectedAt: 0 })
+    const now = TIMEOUT + 1
+    expect(decideTaskTimeout(entry, 'busy', now, { ...BASE_OPTS, sessionShadowed: false })).toBe('alert')
+  })
+
+  it('still alerts normally when sessionShadowed is omitted (default behaviour unchanged)', () => {
+    const entry = makeEntry({ injectedAt: 0 })
+    const now = TIMEOUT + 1
+    expect(decideTaskTimeout(entry, 'busy', now, BASE_OPTS)).toBe('alert')
+  })
+
+  it('a shadowed entry can still be lost on idle -- shadowing only guards the busy-alert path', () => {
+    const entry = makeEntry({ injectedAt: 0, sawTurn: false })
+    const now = GRACE + 1
+    expect(decideTaskTimeout(entry, 'idle', now, { ...BASE_OPTS, sessionShadowed: true })).toBe('lost')
+  })
+
+  it('fix-revert guard: if sessionShadowed were ignored, this would incorrectly read alert', () => {
+    const entry = makeEntry({ injectedAt: 0 })
+    const result = decideTaskTimeout(entry, 'busy', TIMEOUT + 1, { ...BASE_OPTS, sessionShadowed: true })
+    expect(result).toBe('hold')
+    expect(result).not.toBe('alert')
+  })
+})
+
+describe('HERMES223C fix-revert guard: the sweep wires session-sharing evidence through', () => {
+  it('the watchdog snapshots ambiguity once per tick and passes it into decideTaskTimeout', () => {
+    const src = readFileSync(join(__dirname, '../web/schedule-runner.ts'), 'utf-8')
+    expect(src).toMatch(/const sessionShadowedKeys = computeSessionAmbiguity\(taskInflightMap\)/)
+    expect(src).toMatch(/sessionShadowed: sessionShadowedKeys\.has\(key\),/)
   })
 })
 

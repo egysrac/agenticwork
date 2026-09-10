@@ -239,6 +239,48 @@ export function settleExpectedOutput(entry: TaskInflightEntry, now: number): voi
 
 export type TaskTimeoutDecision = 'clear' | 'alert' | 'hold' | 'lost'
 
+// HERMES223C -- shared-pane task attribution (2026-09-09 21:09:29, kanban
+// 223c45c8 comment #107). taskInflightMap is keyed by `${task.name}@${agent}`,
+// not by session, so two tasks that happen to share one tmux session (e.g. the
+// MAIN_CHANNELS_SESSION heartbeats/tasks all funnel into jarvis-channels) get
+// two independent entries watching the SAME physical pane. Observed: both
+// ledger-live-drain and reggeli-napindito fired their own "possible hang"
+// alert off the same busy pane within seconds of each other -- the watchdog
+// had no way to tell which of the two was actually the thing running.
+//
+// Hermes's caution was explicit: do not just raise the threshold, that only
+// delays the same misattribution. The fix needs real execution evidence.
+//
+// The evidence used here: a scheduled prompt is only injected into a session
+// that reads ready (isSessionReadyForPrompt / the SCHEDPARK814 janitor path)
+// -- a busy session gets queued to pending_task_retries instead, never
+// injected. So if entry B on the same session was injected AFTER entry A, that
+// injection succeeding is proof the session went ready again some time after
+// A fired, which means A's own turn had already concluded by then. Any 'busy'
+// pane observed from here on is B's work, not A's -- crediting it to A (and
+// therefore alerting on A) is exactly the misattribution Hermes reported.
+// A is called "shadowed"; only the entry with the latest injectedAt in a
+// session group keeps the ability to alert off that session's busy state.
+export function computeSessionAmbiguity(
+  entries: Iterable<[string, Pick<TaskInflightEntry, 'session' | 'injectedAt'>]>,
+): Set<string> {
+  const bySession = new Map<string, Array<[string, number]>>()
+  for (const [key, entry] of entries) {
+    const list = bySession.get(entry.session)
+    if (list) list.push([key, entry.injectedAt])
+    else bySession.set(entry.session, [[key, entry.injectedAt]])
+  }
+  const shadowed = new Set<string>()
+  for (const list of bySession.values()) {
+    if (list.length < 2) continue
+    const newestInjectedAt = Math.max(...list.map(([, injectedAt]) => injectedAt))
+    for (const [key, injectedAt] of list) {
+      if (injectedAt < newestInjectedAt) shadowed.add(key)
+    }
+  }
+  return shadowed
+}
+
 // Pure: decide what the watchdog should do for a single in-flight entry this
 // tick. Exported so it can be unit-tested without tmux I/O.
 //
@@ -277,7 +319,7 @@ export function decideTaskTimeout(
   entry: Pick<TaskInflightEntry, 'injectedAt' | 'alerted' | 'sawTurn'>,
   paneState: PaneState | null,
   now: number,
-  opts: { graceMs: number; timeoutMs: number; maxTrackMs: number },
+  opts: { graceMs: number; timeoutMs: number; maxTrackMs: number; sessionShadowed?: boolean },
 ): TaskTimeoutDecision {
   const elapsed = now - entry.injectedAt
   if (elapsed >= opts.maxTrackMs) return 'clear'
@@ -291,7 +333,14 @@ export function decideTaskTimeout(
   }
   if (entry.alerted) return 'hold'
   if (elapsed < opts.graceMs) return 'hold'
-  if (paneState === 'busy' && elapsed >= opts.timeoutMs) return 'alert'
+  // HERMES223C: a shadowed entry (an older injection on a session that has
+  // since accepted a newer one -- see computeSessionAmbiguity above) never
+  // gets to alert off a busy pane it cannot prove is its own. It still holds
+  // rather than clearing/losing, so the max-track eviction remains the
+  // backstop instead of this entry vanishing from the map unexplained.
+  if (paneState === 'busy' && elapsed >= opts.timeoutMs) {
+    return opts.sessionShadowed ? 'hold' : 'alert'
+  }
   return 'hold'
 }
 
@@ -1456,6 +1505,12 @@ export function startScheduleRunner(): NodeJS.Timeout {
     // to see if the target session is still busy. If so past TASK_FIRE_TIMEOUT_MS,
     // send a one-shot alert. Clear entries when the session goes idle (task done)
     // or the maximum tracking age is reached.
+    // HERMES223C: snapshot session-sharing ambiguity once per tick, before any
+    // entry in this sweep can be cleared/deleted below -- see
+    // computeSessionAmbiguity for the rationale (only the most-recently
+    // injected entry on a shared session may alert off that session's busy
+    // pane).
+    const sessionShadowedKeys = computeSessionAmbiguity(taskInflightMap)
     for (const [key, entry] of taskInflightMap) {
       const pane = capturePane(entry.session, entry.host)
       const state = pane != null ? detectPaneState(pane) : null
@@ -1478,6 +1533,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
         graceMs: TASK_FIRE_GRACE_MS,
         timeoutMs: entry.timeoutMs,
         maxTrackMs: TASK_FIRE_MAX_TRACK_MS,
+        sessionShadowed: sessionShadowedKeys.has(key),
       })
       if (decision === 'clear') {
         settleExpectedOutput(entry, now)
