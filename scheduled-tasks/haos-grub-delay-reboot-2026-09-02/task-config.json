@@ -1,0 +1,13 @@
+{
+  "schedule": "0 10 2 9 *",
+  "agent": "jarvis",
+  "enabled": true,
+  "type": "command",
+  "createdAt": 1788295249,
+  "description": "HAOS reboot a grub.cfg timeout=300 aktiválásához + verify (command típus, HA Core restart, LLM nélkül).",
+  "command": "curl -sk -X POST -H \"Authorization: Bearer $(python3 -c 'import json;print(json.load(open(\"/home/alex/marveen/store/.homeassistant.json\"))[\"token\"])')\" https://192.168.1.53:8123/api/services/homeassistant/restart",
+  "timeoutMs": 30000,
+  "failThreshold": 3,
+  "skipIfBusy": false,
+  "forceSend": false
+}

@@ -72,6 +72,10 @@ def _connect(timeout=15):
 
 
 def _send_and_recv(ws, payload, timeout=15):
+    # HA rejects command frames without an "id" (error code invalid_format),
+    # so every caller gets one whether it supplied it or not.
+    if "id" not in payload:
+        payload = dict(payload, id=1)
     ws.settimeout(timeout)
     ws.send(json.dumps(payload))
     chunks = []

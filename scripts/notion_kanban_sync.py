@@ -8,9 +8,9 @@ Change detection is CONTENT-BASED (per-record field signature), not timestamp:
 Notion's last_edited_time is only minute-granular, which makes timestamp diffing
 unreliable. Instead we store the last-agreed signature per card and compare.
 
-Rules (Notion is primary on conflict):
-  * Only the side whose signature differs from the last-agreed one is the change;
-    that side is pushed to the other. If both differ -> Notion wins.
+Rules:
+  * Local Marveen is the sole workflow-state authority. Notion state is a mirror.
+  * Content fields are two-way; if both sides changed content, Notion wins.
   * Notion page without LocalID  -> new card from Alex   -> insert local + backfill LocalID.
   * Local card without a Notion row -> new card from me   -> create Notion page.
   * Local card archived/removed -> archive the Notion page.
@@ -36,7 +36,8 @@ DASH = 'http://localhost:3420'
 NOTION = 'https://api.notion.com/v1'
 STATE_FILE = join(STORE, 'notion-kanban-sync-state.json')
 
-FIELDS = ['title', 'status', 'priority', 'assignee', 'description']
+FIELDS = ['title', 'priority', 'assignee', 'description']
+WORKFLOW_STATES = {'new', 'ready', 'running', 'verify', 'repair', 'blocked', 'done'}
 
 
 def _dash_token():
@@ -86,6 +87,7 @@ def local_create(card):
 
 
 def local_update(cid, card):
+    """Content-only generic PUT. Workflow state must use the dashboard /move API."""
     body = {k: card.get(k, '') for k in FIELDS}
     _req(f'{DASH}/api/kanban/{cid}', method='PUT', headers=dash_headers(), body=body)
 
@@ -128,7 +130,7 @@ def notion_pages():
                 'archived': p.get('archived', False),
                 'localid': _plain(props.get('LocalID', {}), 'rich_text'),
                 'title': _plain(props.get('Name', {}), 'title'),
-                'status': _plain(props.get('Status', {}), 'select'),
+                'workflow_state': _plain(props.get('Status', {}), 'select'),
                 'priority': _plain(props.get('Priority', {}), 'select'),
                 'assignee': _plain(props.get('Assignee', {}), 'rich_text'),
                 'description': _plain(props.get('Description', {}), 'rich_text'),
@@ -150,8 +152,9 @@ def _props(card):
     p['Name'] = {'title': [{'text': {'content': title}}]}
     p['Description'] = rt(card.get('description', ''))
     p['Assignee'] = rt(card.get('assignee', ''))
-    if card.get('status'):
-        p['Status'] = {'select': {'name': card['status']}}
+    state = card.get('state') or card.get('workflow_state')
+    if state and str(state).lower() in WORKFLOW_STATES:
+        p['Status'] = {'select': {'name': str(state).upper()}}
     if card.get('priority'):
         p['Priority'] = {'select': {'name': card['priority']}}
     p['LocalID'] = rt(card.get('id', ''))
@@ -167,6 +170,14 @@ def notion_create(card):
 
 def notion_update(page_id, card):
     body = {'properties': _props(card)}
+    _req(f'{NOTION}/pages/{page_id}', method='PATCH', headers=notion_headers(), body=body)
+
+
+def notion_update_state(page_id, state):
+    normalized = str(state).lower()
+    if normalized not in WORKFLOW_STATES:
+        raise ValueError(f'Unknown local workflow state: {state}')
+    body = {'properties': {'Status': {'select': {'name': normalized.upper()}}}}
     _req(f'{NOTION}/pages/{page_id}', method='PATCH', headers=notion_headers(), body=body)
 
 
@@ -208,7 +219,8 @@ def main():
 
     new_stored = {}
     seen_local = set()
-    stats = {'n2l_new': 0, 'n2l_upd': 0, 'l2n_upd': 0, 'l2n_new': 0, 'archived': 0}
+    stats = {'n2l_new': 0, 'n2l_upd': 0, 'l2n_upd': 0, 'l2n_new': 0,
+             'state_reconciled': 0, 'state_unknown': 0, 'archived': 0}
 
     # Notion -> Local (Alex edits in Notion)
     for localid, page in pages_by_localid.items():
@@ -222,40 +234,46 @@ def main():
             local_card = locals_by_id[localid]
             local_sig = _sig({k: local_card.get(k, '') for k in FIELDS})
             prev = stored.get(localid)
-            if local_sig != sig and prev == sig:
-                # Notion changed, local stale
+            if local_sig != sig and prev == local_sig:
+                # Notion content changed; state is deliberately excluded.
                 local_update(localid, page)
                 stats['n2l_upd'] += 1
-            elif local_sig != sig and prev != local_sig:
-                # Conflict: Notion wins
+                new_stored[localid] = sig
+            elif local_sig != sig and prev == sig:
+                notion_update(page['page_id'], local_card)
+                stats['l2n_upd'] += 1
+                new_stored[localid] = local_sig
+            elif local_sig != sig:
+                # Content conflict: retain the historical Notion-wins policy.
                 local_update(localid, page)
                 stats['n2l_upd'] += 1
+                new_stored[localid] = sig
+
+            local_state = str(local_card.get('state') or local_card.get('workflow_state') or '').lower()
+            notion_state = str(page.get('workflow_state') or '').lower()
+            if local_state in WORKFLOW_STATES and notion_state != local_state:
+                if notion_state and notion_state not in WORKFLOW_STATES:
+                    stats['state_unknown'] += 1
+                notion_update_state(page['page_id'], local_state)
+                stats['state_reconciled'] += 1
         else:
             # New card from Alex - insert local + backfill LocalID on Notion
+            # A Notion-created row contributes content only. Its Status never
+            # chooses local workflow state; the local create default does.
             new_card = {k: page.get(k, '') for k in FIELDS}
             res = local_create(new_card)
             cid = res[0] if res else None
             if cid:
                 notion_set_localid(page['page_id'], cid)
+                notion_update_state(page['page_id'], 'ready')
                 stats['n2l_new'] += 1
+                stats['state_reconciled'] += 1
 
     # Local -> Notion (Jarvis/team edits in dashboard)
     for cid, card in locals_by_id.items():
         sig = _sig({k: card.get(k, '') for k in FIELDS})
         new_stored[cid] = sig
-        if cid in pages_by_localid:
-            page = pages_by_localid[cid]
-            page_sig = _sig({k: page.get(k) for k in FIELDS})
-            prev = stored.get(cid)
-            if page_sig != sig and prev == page_sig:
-                # Local changed, Notion stale
-                notion_update(page['page_id'], card)
-                stats['l2n_upd'] += 1
-            elif page_sig != sig and prev != sig:
-                # Conflict: Notion wins - rewrite local from Notion
-                local_update(cid, page)
-                stats['n2l_upd'] += 1
-        else:
+        if cid not in pages_by_localid:
             # New card from me - create Notion page
             page_id = notion_create(card)
             if page_id:

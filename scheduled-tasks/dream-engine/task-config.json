@@ -3,6 +3,7 @@
   "agent": "marveen",
   "enabled": true,
   "type": "dream-engine",
+  "expectedOutputFile": "DREAM.md",
   "skipIfBusy": false,
   "createdAt": 1778480400
 }

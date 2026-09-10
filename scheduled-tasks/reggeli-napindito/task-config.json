@@ -3,5 +3,6 @@
   "agent": "marveen",
   "enabled": true,
   "type": "task",
+  "expectedOutputFile": "MORNING.md",
   "createdAt": 1776153060
 }

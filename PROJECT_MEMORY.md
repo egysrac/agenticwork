@@ -4,6 +4,23 @@ A Marveen projekt tartós tudása. NEM krónológiai tevékenység-napló, hanem
 
 A `skills/marveen-agentic-dev/SKILL.md` a TASK-kezelés szabályait írja le, ez a fájl a PROJEKT-tudást. Architektúra döntések a `decisions/ADR-XXXX.md` fájlokban.
 
+## Master governance (2026-09-04)
+
+**A mukodesi modell EGYETLEN forrasa:**
+`governance/JARVIS_MASTER_AGENTIC_OPERATING_MODEL.md` (v1.0).
+
+Aktiv verzio es megfelelosegi allapot: `governance/POLICY_VERSION.yaml`.
+Dontes: `decisions/ADR-0004.md`. Verziok: `governance/versions/`.
+
+Uj protokoll NEM kulon utasitaskent erkezik, hanem ennek verziozott
+kiegeszitesekent (v1.1, v1.2 ...).
+
+**FIGYELEM (§36, §73):** a dokumentum megléte NEM implementacio. Egy szabaly
+csak akkor teljesitett, ha a deklaralt policy, a futasi konfiguracio ES a
+megfigyelt viselkedes egyezik. A jelenlegi allapot: DECLARED_ONLY.
+A vegrehajtasi sorrend a §74-ben all -- ne rendezd at fuggoseg vagy biztonsagi
+ok nelkul.
+
 ## Architecture
 
 ### Stack

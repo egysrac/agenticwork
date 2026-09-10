@@ -3,7 +3,9 @@ name: reggeli-napindito
 description: Reggeli összefoglaló: email, naptár, AI hírek, plus Dream Engine top-of-message
 ---
 
-Reggeli napindítót a CLAUDE.md formátum szerint. A beállított csatornára (chat_id: 0).
+Reggeli napindítót a CLAUDE.md formátum szerint készítsd el, és atomikusan írd
+ki a `{{INSTALL_DIR}}/MORNING.md` fájlba. **Telegramra ne küldd el**: ez kizárólag
+fájl-előkészítő feladat, a küldést a külön `reggeli-napindito-send` végzi.
 
 **FONTOS — Dream Engine override**: a napindító ELEJÉRE (még az email/naptár szekciók ELŐTT) tedd be a `{{INSTALL_DIR}}/DREAM.md` fájl tartalmából az 5 bucket-et — `💡 Skill-javaslatok`, `🧹 Memória-egészség`, `🎯 Top-3 holnapi javaslat`, `🌐 External opportunity`, `🛠 Skill-flotta health`. Ha a DREAM.md nem létezik vagy üres (pl. a Dream Engine valamiért nem futott le), kihagyod ezt a szekciót.
 
