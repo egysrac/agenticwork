@@ -256,6 +256,29 @@ def main():
                     stats['state_unknown'] += 1
                 notion_update_state(page['page_id'], local_state)
                 stats['state_reconciled'] += 1
+        elif localid in stored:
+            # RESURRECT-FIX: this LocalID was known from a previous run (it's
+            # in `stored`) but is missing from locals_by_id, i.e. the local
+            # card was archived/deleted since the last sync -- NOT a fresh
+            # Notion-side creation. The "Archive removed local cards" loop
+            # below is meant to be the one propagating that archive to
+            # Notion, but it never gets the chance: this loop runs first, the
+            # Notion page isn't archived yet at this point in the SAME run,
+            # so falling through to the generic "new card from Alex" branch
+            # below would resurrect the archived card as a brand-new local
+            # card before the archive-propagation loop ever saw it archived
+            # locally at line ~231's seen_local.add already having claimed it.
+            # (Observed 2026-09-10 08:03: 8 cards Alex had just archived came
+            # back as 8 new cards two hours later.) Archive the Notion side
+            # here instead, before the resurrection window opens, and drop
+            # the pair from state. seen_local already contains this localid
+            # (added above, before this branch runs) -- left as-is on purpose
+            # so the later "Archive removed local cards" loop treats it as
+            # already handled and does not also call notion_archive on it.
+            if not page['archived']:
+                notion_archive(page['page_id'])
+                stats['archived'] += 1
+            new_stored.pop(localid, None)
         else:
             # New card from Alex - insert local + backfill LocalID on Notion
             # A Notion-created row contributes content only. Its Status never
