@@ -25,8 +25,8 @@ const BASE_OPTS = { graceMs: GRACE, timeoutMs: TIMEOUT, maxTrackMs: MAX_TRACK }
 // written for a task that really did start running, and the watchdog's original
 // contract (idle => done) is only correct for those. The sawTurn=false cases --
 // an injection that never started a turn -- get their own describe block below.
-function makeEntry(overrides: Partial<Pick<TaskInflightEntry, 'injectedAt' | 'alerted' | 'sawTurn'>> = {}): Pick<TaskInflightEntry, 'injectedAt' | 'alerted' | 'sawTurn'> {
-  return { injectedAt: 0, alerted: false, sawTurn: true, ...overrides }
+function makeEntry(overrides: Partial<Pick<TaskInflightEntry, 'injectedAt' | 'alerted' | 'sawTurn' | 'expectedOutput'>> = {}): Pick<TaskInflightEntry, 'injectedAt' | 'alerted' | 'sawTurn' | 'expectedOutput'> {
+  return { injectedAt: 0, alerted: false, sawTurn: true, expectedOutput: undefined, ...overrides }
 }
 
 // --- Grace period ---
@@ -256,6 +256,60 @@ describe('fix-revert guard: alert case is load-bearing', () => {
     // this assertion would fail: that is the correct behaviour.
     expect(result).toBe('alert')
     expect(result).not.toBe('hold')
+  })
+})
+
+// --- DREAMLOOP0912: expectedOutput tasks need patience before an idle read
+// is trusted ---
+//
+// 2026-09-12: dream-engine fired 24x in 30 minutes, reggeli-napindito 6x in
+// ~3 minutes -- both are multi-minute, many-tool-call file-preparation jobs
+// (DREAM.md / MORNING.md), and idle+sawTurn used to clear unconditionally
+// right after TASK_FIRE_GRACE_MS (60s), regardless of how unrealistic that is
+// for these two tasks. A single idle-looking pane sample mid-turn triggered
+// settleExpectedOutput before the file had actually been rewritten, which
+// logged 'output-stale' and queued an immediate retry -- repeating every
+// ~75s and compounding into the storm. Ordinary heartbeats (no
+// expectedOutput on the entry) are unaffected and keep clearing right after
+// graceMs, which is what the 'idle clear' tests above pin.
+
+describe('decideTaskTimeout: DREAMLOOP0912 -- expectedOutput tasks wait for timeoutMs before idle clears', () => {
+  it('holds (does not clear) when idle right after grace but before timeoutMs, for a task with expectedOutput', () => {
+    const entry = makeEntry({ injectedAt: 0, expectedOutput: { path: '/x/DREAM.md', fingerprint: 'abc' } })
+    const now = GRACE + 1000
+    expect(decideTaskTimeout(entry, 'idle', now, BASE_OPTS)).toBe('hold')
+  })
+
+  it('still clears once timeoutMs has elapsed, even with expectedOutput set', () => {
+    const entry = makeEntry({ injectedAt: 0, expectedOutput: { path: '/x/DREAM.md', fingerprint: 'abc' } })
+    const now = TIMEOUT + 1
+    expect(decideTaskTimeout(entry, 'idle', now, BASE_OPTS)).toBe('clear')
+  })
+
+  it('a per-task stuckAfterMinutes override extends the hold window accordingly', () => {
+    const generousTimeoutMs = resolveStuckTimeoutMs({ stuckAfterMinutes: 20 })
+    const entry = makeEntry({ injectedAt: 0, expectedOutput: { path: '/x/DREAM.md', fingerprint: 'abc' } })
+    // 9 minutes elapsed -- past the old 5-minute default, comfortably inside
+    // the 20-minute override (matches the live ~9-minute DREAM.md write time).
+    const now = 9 * 60_000
+    expect(decideTaskTimeout(entry, 'idle', now, { ...BASE_OPTS, timeoutMs: generousTimeoutMs })).toBe('hold')
+  })
+
+  it('ordinary heartbeats (no expectedOutput) are unaffected -- still clear right after grace', () => {
+    const entry = makeEntry({ injectedAt: 0 })
+    const now = GRACE + 1000
+    expect(decideTaskTimeout(entry, 'idle', now, BASE_OPTS)).toBe('clear')
+  })
+
+  it('fix-revert guard: without the expectedOutput check this test would incorrectly pass at grace+1000ms', () => {
+    // Proves the new branch is load-bearing: an entry WITH expectedOutput at
+    // an elapsed time well short of timeoutMs must NOT behave like a plain
+    // heartbeat. If the DREAMLOOP0912 branch were removed, this would return
+    // 'clear' instead of 'hold' and the assertion would fail.
+    const entry = makeEntry({ injectedAt: 0, expectedOutput: { path: '/x/MORNING.md', fingerprint: null } })
+    const result = decideTaskTimeout(entry, 'idle', GRACE + 1000, BASE_OPTS)
+    expect(result).toBe('hold')
+    expect(result).not.toBe('clear')
   })
 })
 

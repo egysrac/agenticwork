@@ -315,8 +315,24 @@ export function computeSessionAmbiguity(
 //   - 'typing': post-send resubmit loop is already active.
 // Clearing on these states would drop the entry before the 300s timeout can
 // fire, producing false-negative coverage for genuinely stuck tasks.
+//
+// DREAMLOOP0912 (2026-09-12). dream-engine fired 24x in 30 minutes and
+// reggeli-napindito 6x in ~3 minutes: both are multi-minute, many-tool-call
+// file-preparation jobs (DREAM.md / MORNING.md; live measurement: the DREAM.md
+// write took ~9 minutes), but idle+sawTurn used to clear unconditionally the
+// instant TASK_FIRE_GRACE_MS elapsed. A single idle-looking pane sample
+// mid-turn (a render-timing artifact between tool calls, not a real return to
+// the prompt) was read as "done", which triggered settleExpectedOutput before
+// the file had actually been rewritten -- that logged 'output-stale' and
+// queued an immediate retry, and each retry repeated the same false positive
+// ~75s later (GRACE_MS + one tick), compounding into the storm. Fix: an entry
+// with expectedOutput set is not trusted as genuinely finished off one idle
+// sample alone -- it holds until opts.timeoutMs (the same per-task
+// stuckAfterMinutes-overridable threshold the busy/alert branch already
+// grants) has elapsed. Ordinary heartbeats (no expectedOutput) are unaffected
+// and keep clearing right after graceMs.
 export function decideTaskTimeout(
-  entry: Pick<TaskInflightEntry, 'injectedAt' | 'alerted' | 'sawTurn'>,
+  entry: Pick<TaskInflightEntry, 'injectedAt' | 'alerted' | 'sawTurn' | 'expectedOutput'>,
   paneState: PaneState | null,
   now: number,
   opts: { graceMs: number; timeoutMs: number; maxTrackMs: number; sessionShadowed?: boolean },
@@ -324,7 +340,14 @@ export function decideTaskTimeout(
   const elapsed = now - entry.injectedAt
   if (elapsed >= opts.maxTrackMs) return 'clear'
   if (paneState === 'idle') {
-    if (entry.sawTurn) return 'clear'
+    if (entry.sawTurn) {
+      // DREAMLOOP0912: hold instead of clearing if this task has an
+      // expectedOutput obligation and hasn't reached the stuck-timeout
+      // threshold yet -- a mid-turn idle blip cannot trigger a premature
+      // output check and false-positive retry storm.
+      if (entry.expectedOutput && elapsed < opts.timeoutMs) return 'hold'
+      return 'clear'
+    }
     // Idle, and nothing ever showed the prompt being picked up. Inside the
     // grace window that is just the normal pre-turn lag, so hold; past it the
     // delivery is gone.
