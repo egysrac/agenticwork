@@ -41,6 +41,9 @@ reports/
 test-results/
 .playwright-mcp/
 
+# Generated metrics reports (scripts/aggregate-agent-metrics.ts local output)
+metrics/
+
 # macOS
 .DS_Store
 
