@@ -90,6 +90,16 @@ def escape_markdown_v2(text: str) -> str:
 
     text = MD_V2_BOLD.sub(_stash, text)
     text = re.sub(f"([{MD_V2_ESCAPE_CHARS}])", r"\\\1", text)
+    # Minden itt megmaradt `*` NEM bold-pár (azok már stash-elve vannak) --
+    # hanem szövegbeli literál csillag (pl. `store/*.log` glob-minta, `40%+`
+    # mellett, szorzás stb.). Ezeket escape-elni kell, különben a Telegram
+    # MarkdownV2 parser párosítatlan bold-nyitásnak/zárásnak nézi őket és
+    # elutasítja az egész üzenetet ("Can't find end of Bold entity",
+    # 2026-09-12 reggeli-monitor riasztás, `store/*.log` a MORNING.md-ben).
+    # FONTOS: ez a csere a `\`-escapelő lépés UTÁN fut, különben a fentebb
+    # beszúrt escape-backslash-t az a lépés újra escape-elné (`\*` -> `\\*`),
+    # ami megint nyers, párosítatlan csillagot hagyna a szövegben.
+    text = text.replace("*", "\\*")
     for i, original in enumerate(saved):
         text = text.replace(f"\x00BOLD{i}\x00", original)
     for i, original in enumerate(saved_code):
