@@ -407,10 +407,18 @@ repair_morning_timer() {
 # Idempotent: it only touches units that still carry the old value.
 migrate_channels_restart() {
   units_dir="${1:-$HOME/.config/systemd/user}"
+  unit_pattern="${2:-*-channels.service}"
+  unit_scope="${3:-user}"
+  expected_install="${4:-}"
   [ -d "$units_dir" ] || return 0
   _patched=0
-  for chan_unit in "$units_dir/"*-channels.service; do
+  for chan_unit in "$units_dir/"$unit_pattern; do
     [ -f "$chan_unit" ] || continue
+    if [ -n "$expected_install" ] \
+        && ! grep -Fxq "ExecStart=${expected_install}/scripts/channels.sh" "$chan_unit" \
+        && ! grep -Fxq "ExecStart=${expected_install}/scripts/channels.sh --service-managed" "$chan_unit"; then
+      continue
+    fi
     if grep -q '^Restart=on-failure[[:space:]]*$' "$chan_unit"; then
       if sed -i.marveen-bak 's/^Restart=on-failure[[:space:]]*$/Restart=always/' "$chan_unit" 2>/dev/null; then
         rm -f "${chan_unit}.marveen-bak"
@@ -420,16 +428,82 @@ migrate_channels_restart() {
         echo -e "  FIGYELEM: a csatorna-unit nem volt irhato: $chan_unit"
       fi
     fi
+    if grep -q '^ExecStart=.*/scripts/channels\.sh[[:space:]]*$' "$chan_unit"; then
+      if sed -i.marveen-bak 's|^\(ExecStart=.*/scripts/channels\.sh\)[[:space:]]*$|\1 --service-managed|' "$chan_unit" 2>/dev/null; then
+        rm -f "${chan_unit}.marveen-bak"
+        _patched=1
+        echo -e "  Csatorna-unit javitva (service-managed inditas): $(basename "$chan_unit")"
+      else
+        echo -e "  FIGYELEM: a csatorna-unit ExecStart sora nem volt irhato: $chan_unit"
+      fi
+    fi
   done
   if [ "$_patched" = "1" ]; then
-    systemctl --user daemon-reload 2>/dev/null || true
+    if [ "$unit_scope" = "system" ]; then
+      systemctl daemon-reload 2>/dev/null || true
+    else
+      systemctl --user daemon-reload 2>/dev/null || true
+    fi
   fi
+  return 0
+}
+
+migrate_channels_launchagent() {
+  launch_dir="${1:-$HOME/Library/LaunchAgents}"
+  [ -d "$launch_dir" ] || return 0
+  for chan_plist in "$launch_dir/"*channels*.plist; do
+    [ -f "$chan_plist" ] || continue
+    _result="$(python3 - "$chan_plist" <<'PYEOF'
+import os, re, stat, sys, tempfile
+path = sys.argv[1]
+try:
+    text = open(path, encoding="utf-8").read()
+except OSError:
+    print("error")
+    raise SystemExit
+if "<string>--service-managed</string>" in text:
+    print("unchanged")
+    raise SystemExit
+pattern = r'(<string>[^<]*/scripts/channels\.sh</string>)'
+updated, count = re.subn(pattern, r'\1\n    <string>--service-managed</string>', text, count=1)
+if count != 1:
+    print("unchanged")
+    raise SystemExit
+st = os.stat(path)
+dirname = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(prefix=".channels-plist-", suffix=".tmp", dir=dirname)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(updated)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, stat.S_IMODE(st.st_mode))
+    os.replace(tmp, path)
+finally:
+    try: os.unlink(tmp)
+    except FileNotFoundError: pass
+print("changed")
+PYEOF
+)"
+    if [ "$_result" = "changed" ]; then
+      echo -e "  Channels LaunchAgent javitva (service-managed inditas): $(basename "$chan_plist")"
+    elif [ "$_result" = "error" ]; then
+      echo -e "  FIGYELEM: a Channels LaunchAgent nem volt olvashato: $chan_plist"
+    fi
+  done
   return 0
 }
 
 run_unit_maintenance() {
   repair_morning_timer "$@"
   migrate_channels_restart "$@"
+  # Root/system-scope installs are supported by start.sh/stop.sh. Migrate only
+  # units whose ExecStart points at this exact installation, and only when the
+  # directory is writable by the current authorized update process.
+  if [ -d /etc/systemd/system ] && [ -w /etc/systemd/system ]; then
+    migrate_channels_restart /etc/systemd/system '*-channels.service' system "$INSTALL_DIR"
+  fi
+  migrate_channels_launchagent
   return 0
 }
 run_unit_maintenance

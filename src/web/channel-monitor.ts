@@ -1001,6 +1001,10 @@ export function mainChannelsSessionExists(): boolean {
 export type MainSessionCreateResult = 'started' | 'grace' | 'script-missing' | 'spawn-failed'
 
 export function createMainChannelsSession(): MainSessionCreateResult {
+  // Close the check/create race for every caller. Service management or
+  // another recovery path may have created the canonical session since the
+  // caller's probe; never spawn a duplicate supervisor in that case.
+  if (mainChannelsSessionExists()) return 'grace'
   const now = Date.now()
   if (marveenLastSessionCreate && now - marveenLastSessionCreate < MAIN_SESSION_CREATE_GRACE_MS) {
     return 'grace'
@@ -1014,7 +1018,7 @@ export function createMainChannelsSession(): MainSessionCreateResult {
     // session in a wait loop), so it must outlive this check() tick without
     // keeping the dashboard event loop alive. stdio ignored -- channels.sh does
     // its own logging to store/channels-failures.log.
-    const child = spawn('/bin/bash', [CHANNELS_SCRIPT], {
+    const child = spawn('/bin/bash', [CHANNELS_SCRIPT, '--create-if-absent'], {
       detached: true,
       stdio: 'ignore',
       cwd: PROJECT_ROOT,

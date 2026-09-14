@@ -778,6 +778,21 @@ async function attemptFireTask(
     // sends once Claude has booted (isSessionReadyForPrompt). host-aware:
     // startAgentProcess is itself remote-aware and launches over ssh when the
     // target agent is remote, so a missing remote session is auto-started too.
+    // MAIN_AGENT_ID is not a profile-managed sub-agent: it intentionally has
+    // no agents/<id> directory and owns `${MAIN_AGENT_ID}-channels`, created by
+    // scripts/channels.sh. Use the canonical non-destructive creator; started
+    // and grace both mean one launch is already in flight.
+    if (agentName === MAIN_AGENT_ID && !task.targetSession) {
+      const { createMainChannelsSession } = await import('./channel-monitor.js')
+      const created = createMainChannelsSession()
+      if (created === 'started' || created === 'grace') {
+        logger.info({ task: task.name, agent: agentName, session, created }, 'Schedule target main session missing; canonical channels start is in flight')
+        return 'starting'
+      }
+      logger.warn({ task: task.name, agent: agentName, session, created }, 'Schedule target main session missing, canonical channels start failed')
+      return 'missing'
+    }
+
     const start = await startAgentProcess(agentName)
     if (!start.ok) {
       // "already running" means it raced up between the check and here -- treat

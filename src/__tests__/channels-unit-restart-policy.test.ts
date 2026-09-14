@@ -36,6 +36,9 @@ const CHANNELS = readFileSync(join(ROOT, 'scripts', 'channels.sh'), 'utf-8')
 const LINUX = readFileSync(join(ROOT, 'install-linux.sh'), 'utf-8')
 const MACOS = readFileSync(join(ROOT, 'install-macos.sh'), 'utf-8')
 const UPDATE = readFileSync(join(ROOT, 'update.sh'), 'utf-8')
+const START = readFileSync(join(ROOT, 'scripts', 'start.sh'), 'utf-8')
+const SHIPPED_UNIT = readFileSync(join(ROOT, 'scripts', 'systemd', 'marveen-channels.service'), 'utf-8')
+const FIX_AVX = readFileSync(join(ROOT, 'scripts', 'fix-avx.sh'), 'utf-8')
 
 /** Slice a region [from marker .. end marker]. The end is searched FROM the
  *  start offset, never from 0 -- an earlier match would silently return a
@@ -105,17 +108,26 @@ describe('channels.sh watchdog exit status', () => {
   it('sets the flag in BOTH watchdog branches, not just the one that was observed', () => {
     const sustained = sliceBetween(CHANNELS, 'plugin dead for $((NOW - PLUGIN_DEAD_SINCE))s', 'break')
     const neverStarted = sliceBetween(CHANNELS, 'plugin never started within', 'break')
-    expect(sustained).toContain('RESTART_REQUESTED=1')
-    expect(neverStarted).toContain('RESTART_REQUESTED=1')
+    expect(sustained).toContain('request_service_restart')
+    expect(neverStarted).toContain('request_service_restart')
+  })
+
+  it('publishes watchdog intent atomically without overwriting operator intent', () => {
+    const fn = sliceShellFn(CHANNELS, 'request_service_restart')
+    expect(fn).toContain('set -C')
+    expect(fn).toContain('> "$CHANNELS_RESTART_INTENT"')
+    expect(fn).not.toContain('mv "$_intent_tmp"')
+    expect(fn.indexOf('set -C')).toBeLessThan(fn.indexOf('RESTART_REQUESTED=1'))
   })
 })
 
 describe('installer unit template', () => {
   const chanUnit = sliceBetween(LINUX, 'cat >"$SYSTEMD_DIR/${CHAN_UNIT}.service" <<EOF', '\nEOF')
 
-  it('writes Restart=always for the channels unit', () => {
+  it('writes Restart=always and service-managed startup for the channels unit', () => {
     expect(chanUnit).toMatch(/^Restart=always$/m)
     expect(chanUnit).not.toMatch(/^Restart=on-failure$/m)
+    expect(chanUnit).toMatch(/^ExecStart=.*\/scripts\/channels\.sh --service-managed$/m)
   })
 
   it('keeps the crash-loop throttle that bounds the new restart policy', () => {
@@ -128,16 +140,36 @@ describe('installer unit template', () => {
     expect(dashUnit).toMatch(/^Restart=on-failure$/m)
   })
 
-  it('the macOS side already restarts regardless of exit code -- this is the symmetry being restored', () => {
+  it('the macOS side restarts regardless of exit code and uses service-managed startup', () => {
     expect(MACOS).toContain('<key>KeepAlive</key>')
+    expect(MACOS).toContain('<string>--service-managed</string>')
+  })
+
+  it('the no-systemd fallback and shipped unit use service-managed startup', () => {
+    expect(START).toContain('scripts/channels.sh\" --service-managed')
+    expect(LINUX).toContain('scripts/channels.sh\" --service-managed')
+    expect(SHIPPED_UNIT).toMatch(/^ExecStart=.*\/scripts\/channels\.sh --service-managed$/m)
+  })
+
+  it('the AVX repair instructions request a real session restart', () => {
+    expect(FIX_AVX).toContain('scripts/channels.sh restart')
   })
 })
 
 describe('update.sh migration for already-installed machines', () => {
   const fn = sliceShellFn(UPDATE, 'migrate_channels_restart')
+  const macFn = sliceShellFn(UPDATE, 'migrate_channels_launchagent')
 
   function runMigration(unitsDir: string): { out: string; code: number } {
     return runScript(`${fn}\nmigrate_channels_restart "${unitsDir}"`)
+  }
+
+  function runMacMigration(launchDir: string): { out: string; code: number } {
+    return runScript(`${macFn}\nmigrate_channels_launchagent "${launchDir}"`)
+  }
+
+  function runSystemMigration(unitsDir: string, installDir: string): { out: string; code: number } {
+    return runScript(`${fn}\nmigrate_channels_restart "${unitsDir}" '*-channels.service' system "${installDir}"`)
   }
 
   const OLD_UNIT = [
@@ -167,8 +199,8 @@ describe('update.sh migration for already-installed machines', () => {
       const after = readFileSync(unit, 'utf-8')
       expect(after).toMatch(/^Restart=always$/m)
       expect(after).not.toMatch(/^Restart=on-failure$/m)
+      expect(after).toMatch(/^ExecStart=\/root\/marveen\/scripts\/channels\.sh --service-managed$/m)
       // everything else must survive verbatim
-      expect(after).toContain('ExecStart=/root/marveen/scripts/channels.sh')
       expect(after).toContain('StartLimitBurst=5')
       expect(readdirSync(dir).filter((f) => f.includes('marveen-bak'))).toEqual([])
     } finally {
@@ -199,6 +231,48 @@ describe('update.sh migration for already-installed machines', () => {
       writeFileSync(unit, OLD_UNIT)
       runMigration(dir)
       expect(readFileSync(unit, 'utf-8')).toMatch(/^Restart=always$/m)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('migrates only the current writable system-scope installation', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'system-units-'))
+    try {
+      const current = join(dir, 'current-channels.service')
+      const other = join(dir, 'other-channels.service')
+      const prefixCollision = join(dir, 'collision-channels.service')
+      writeFileSync(current, OLD_UNIT.replaceAll('/root/marveen', '/opt/current'))
+      writeFileSync(other, OLD_UNIT.replaceAll('/root/marveen', '/opt/other'))
+      const collisionText = OLD_UNIT.replace('ExecStart=/root/marveen/scripts/channels.sh', 'ExecStart=/opt/current/scripts/channels.sh-OTHER')
+      writeFileSync(prefixCollision, collisionText)
+      const r = runSystemMigration(dir, '/opt/current')
+      expect(r.code).toBe(0)
+      expect(readFileSync(current, 'utf-8')).toMatch(/^Restart=always$/m)
+      expect(readFileSync(current, 'utf-8')).toContain('channels.sh --service-managed')
+      expect(readFileSync(other, 'utf-8')).toBe(OLD_UNIT.replaceAll('/root/marveen', '/opt/other'))
+      expect(readFileSync(prefixCollision, 'utf-8')).toBe(collisionText)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('migrates an existing macOS LaunchAgent idempotently', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'launchagents-'))
+    try {
+      const plist = join(dir, 'com.marveen.channels.plist')
+      writeFileSync(plist, [
+        '<plist><dict><key>ProgramArguments</key><array>',
+        '    <string>/Users/alex/marveen/scripts/channels.sh</string>',
+        '</array><key>KeepAlive</key><true/></dict></plist>',
+      ].join('\n'))
+      const first = runMacMigration(dir)
+      expect(first.code).toBe(0)
+      expect(readFileSync(plist, 'utf-8')).toContain('<string>--service-managed</string>')
+      const once = readFileSync(plist, 'utf-8')
+      const second = runMacMigration(dir)
+      expect(second.code).toBe(0)
+      expect(readFileSync(plist, 'utf-8')).toBe(once)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

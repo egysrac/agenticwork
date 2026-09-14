@@ -1282,6 +1282,7 @@ cat > "$PLIST_DIR/${CHANNELS_PLIST}.plist" << PLISTEOF
   <key>ProgramArguments</key>
   <array>
     <string>${INSTALL_DIR}/scripts/channels.sh</string>
+    <string>--service-managed</string>
   </array>
   <key>WorkingDirectory</key>
   <string>${INSTALL_DIR}</string>

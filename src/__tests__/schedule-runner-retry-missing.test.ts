@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ScheduledTask } from '../web/scheduled-tasks-io.js'
+import { MAIN_AGENT_ID } from '../config.js'
 
 // A pending retry whose target session is MISSING (and whose auto-start fails)
 // must survive the tick, not be deleted. Deleting it was a silent abandonment
@@ -34,6 +35,7 @@ const mockListPendingRetries = vi.fn(() => [] as unknown[])
 const mockSendPrompt = vi.fn(() => 'sent')
 const mockSessionExists = vi.fn(() => true)
 const mockStartAgent = vi.fn(() => ({ ok: false, error: 'tmux unavailable' }))
+const mockCreateMainSession = vi.fn(() => 'started')
 const mockListScheduledTasks = vi.fn(() => [] as ScheduledTask[])
 
 vi.mock('../logger.js', () => ({
@@ -85,6 +87,10 @@ vi.mock('../web/agent-process.js', () => ({
   capturePane: () => null,
   sendEnterToSession: vi.fn(),
   clearStaleParkedInput: vi.fn(() => false),
+}))
+
+vi.mock('../web/channel-monitor.js', () => ({
+  createMainChannelsSession: () => mockCreateMainSession(),
 }))
 
 function task(overrides: Partial<ScheduledTask> & { name: string; schedule: string }): ScheduledTask {
@@ -243,5 +249,50 @@ describe('schedule runner: pending retry survives a missing target session', () 
     expect(mockInsertPendingRetry).toHaveBeenCalledWith(
       'reggeli-napindito', 'retryagent', expect.any(Number), 'error',
     )
+  })
+})
+
+describe('schedule runner: missing configured main-agent session', () => {
+  beforeEach(() => {
+    vi.stubEnv('SCHEDULER_TZ', 'Europe/Budapest')
+    vi.clearAllMocks()
+    mockSessionExists.mockReturnValue(false)
+    mockCreateMainSession.mockReturnValue('started')
+    mockListScheduledTasks.mockReturnValue([task({
+      name: 'reggeli-napindito',
+      schedule: '30 7 * * *',
+      agent: MAIN_AGENT_ID,
+      targetSession: undefined,
+    })])
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('run-now creates the canonical channels session and persists one retry', async () => {
+    const { runScheduledTaskNow } = await loadRunner()
+
+    const result = await runScheduledTaskNow('reggeli-napindito')
+
+    expect(result).toEqual({ ok: true, result: `${MAIN_AGENT_ID}: starting` })
+    expect(mockCreateMainSession).toHaveBeenCalledTimes(1)
+    expect(mockStartAgent).not.toHaveBeenCalled()
+    expect(mockInsertPendingRetry).toHaveBeenCalledTimes(1)
+    expect(mockInsertPendingRetry).toHaveBeenCalledWith(
+      'reggeli-napindito', MAIN_AGENT_ID, expect.any(Number), 'starting',
+    )
+    expect(mockSendPrompt).not.toHaveBeenCalled()
+  })
+
+  it('treats the creator single-flight grace as starting, without injecting a duplicate prompt', async () => {
+    mockCreateMainSession.mockReturnValue('grace')
+    const { runScheduledTaskNow } = await loadRunner()
+
+    const result = await runScheduledTaskNow('reggeli-napindito')
+
+    expect(result).toEqual({ ok: true, result: `${MAIN_AGENT_ID}: starting` })
+    expect(mockInsertPendingRetry).toHaveBeenCalledTimes(1)
+    expect(mockSendPrompt).not.toHaveBeenCalled()
   })
 })

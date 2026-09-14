@@ -49,6 +49,7 @@ describe("channel-monitor: self-healing vanished main session", () => {
     expect(fn).toContain("spawn(")
     expect(fn).toContain("detached: true")
     expect(fn).toContain(".unref()")
+    expect(fn).toContain("'--create-if-absent'")
   })
 
   it("createMainChannelsSession is throttled by a multi-minute grace", () => {
@@ -58,6 +59,14 @@ describe("channel-monitor: self-healing vanished main session", () => {
     expect(m, "MAIN_SESSION_CREATE_GRACE_MS constant not found").not.toBeNull()
     const value = parseInt((m![1] as string).replace(/_/g, ""), 10)
     expect(value).toBeGreaterThanOrEqual(120_000)
+  })
+
+  it("createMainChannelsSession rechecks existence before spawning", () => {
+    const fn = sliceFn("createMainChannelsSession")
+    const existsIdx = fn.indexOf("mainChannelsSessionExists()")
+    const spawnIdx = fn.indexOf("spawn(")
+    expect(existsIdx).toBeGreaterThan(0)
+    expect(spawnIdx).toBeGreaterThan(existsIdx)
   })
 
   it("createMainChannelsSession writes the shared respawn stamp for cold-start grace", () => {

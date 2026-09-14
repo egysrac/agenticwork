@@ -78,7 +78,7 @@ elif [ "$OS" = "Linux" ]; then
     [ -f "$INSTALL_DIR/dist/index.js" ] || (cd "$INSTALL_DIR" && npm run build)
     nohup "$NODE_BIN" "$INSTALL_DIR/dist/index.js" > "$INSTALL_DIR/store/dashboard.log" 2>&1 &
     echo $! > "$INSTALL_DIR/store/dashboard.pid"
-    nohup bash "$INSTALL_DIR/scripts/channels.sh" > "$INSTALL_DIR/store/channels.log" 2>&1 &
+    nohup bash "$INSTALL_DIR/scripts/channels.sh" --service-managed > "$INSTALL_DIR/store/channels.log" 2>&1 &
     echo $! > "$INSTALL_DIR/store/channels.pid"
   fi
 fi

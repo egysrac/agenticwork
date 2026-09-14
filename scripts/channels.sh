@@ -243,6 +243,121 @@ if [ "${1:-}" = "--classify-unlock-residue" ]; then
   exit 0
 fi
 
+# Cross-process ownership lasts for the supervisor lifetime. Dashboard,
+# systemd and launchd may all enter here concurrently. Use a kernel-owned
+# advisory lock: the open fd owns it atomically, and the kernel releases it if
+# the holder is killed. No PID publication window or stale/PID-reuse recovery
+# exists in this model.
+CHANNELS_START_MODE="supervise"
+case "${1:-}" in
+  --create-if-absent) CHANNELS_START_MODE="create-if-absent" ;;
+  --service-managed) CHANNELS_START_MODE="service-managed" ;;
+  restart) CHANNELS_START_MODE="restart" ;;
+  "") : ;;
+  *) echo "Usage: $0 [--create-if-absent|--service-managed|restart]" >&2; exit 2 ;;
+esac
+CHANNELS_OWNER_FILE="$INSTALL_DIR/store/.channels-supervisor.lock"
+CHANNELS_RESTART_INTENT="$INSTALL_DIR/store/.channels-restart-requested"
+mkdir -p "$INSTALL_DIR/store" 2>/dev/null || {
+  echo "ERROR: cannot create channels store directory: $INSTALL_DIR/store" >&2
+  exit 1
+}
+# Snapshot intent before ownership. If a different requester publishes a marker
+# after this process acquires the lock but before it creates/adopts a session,
+# this process must yield without consuming that newer request.
+CHANNELS_INITIAL_RESTART_INTENT="$(cat "$CHANNELS_RESTART_INTENT" 2>/dev/null || true)"
+CHANNELS_OWNS_RESTART_INTENT=false
+channels_process_identity() {
+  _identity_pid="$1"
+  if [ -r "/proc/${_identity_pid}/stat" ]; then
+    awk '{print $22}' "/proc/${_identity_pid}/stat" 2>/dev/null
+  else
+    /bin/ps -p "$_identity_pid" -o lstart= 2>/dev/null | cksum | awk '{print $1 ":" $2}'
+  fi
+}
+restart_intent_owner_alive() {
+  [ -f "$CHANNELS_RESTART_INTENT" ] || return 1
+  read -r _intent_kind _intent_pid _intent_identity _intent_ts < "$CHANNELS_RESTART_INTENT" || return 1
+  [ "$_intent_kind" = "operator" ] || return 1
+  case "$_intent_pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$_intent_pid" 2>/dev/null || return 1
+  if [ -r "/proc/${_intent_pid}/stat" ]; then
+    _intent_state="$(awk '{print $3}' "/proc/${_intent_pid}/stat" 2>/dev/null)"
+  else
+    _intent_state="$(/bin/ps -p "$_intent_pid" -o stat= 2>/dev/null | awk '{print $1}')"
+  fi
+  case "$_intent_state" in Z*|z*) return 1 ;; esac
+  _current_identity="$(channels_process_identity "$_intent_pid")"
+  [ -n "$_current_identity" ] && [ "$_current_identity" = "$_intent_identity" ]
+}
+CHANNELS_LOCK_HELPER_PID=""
+CHANNELS_LOCK_READY="${CHANNELS_OWNER_FILE}.ready.$$"
+CHANNELS_LOCK_FAILED="${CHANNELS_OWNER_FILE}.failed.$$"
+release_channels_owner() {
+  if [ -n "$CHANNELS_LOCK_HELPER_PID" ]; then
+    kill "$CHANNELS_LOCK_HELPER_PID" 2>/dev/null || true
+    wait "$CHANNELS_LOCK_HELPER_PID" 2>/dev/null || true
+    CHANNELS_LOCK_HELPER_PID=""
+  fi
+  rm -f "$CHANNELS_LOCK_READY" "$CHANNELS_LOCK_FAILED" 2>/dev/null || true
+}
+acquire_channels_owner() {
+  command -v python3 >/dev/null 2>&1 || {
+    echo "ERROR: channels supervisor requires python3 for portable OS locking" >&2
+    return 2
+  }
+  rm -f "$CHANNELS_LOCK_READY" "$CHANNELS_LOCK_FAILED" 2>/dev/null || true
+  # A dedicated helper owns the advisory lock. Python opens descriptors
+  # close-on-exec by default, and the helper is a sibling of tmux rather than
+  # its ancestor, so neither a new tmux server nor its children can inherit the
+  # lifetime lock. fcntl.flock is available on both Linux and macOS.
+  python3 - "$CHANNELS_OWNER_FILE" "$CHANNELS_START_MODE" "$$" \
+      "$CHANNELS_LOCK_READY" "$CHANNELS_LOCK_FAILED" <<'PYEOF' &
+import fcntl, os, signal, sys, time
+path, mode, parent, ready, failed = sys.argv[1:]
+parent = int(parent)
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+os.set_inheritable(fd, False)
+try:
+    flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if mode == "create-if-absent" else 0)
+    try:
+        fcntl.flock(fd, flags)
+    except BlockingIOError:
+        open(failed, "w").close()
+        sys.exit(75)
+    open(ready, "w").close()
+    while os.getppid() == parent:
+        time.sleep(0.1)
+finally:
+    os.close(fd)
+PYEOF
+  CHANNELS_LOCK_HELPER_PID=$!
+  while [ ! -e "$CHANNELS_LOCK_READY" ] && [ ! -e "$CHANNELS_LOCK_FAILED" ]; do
+    kill -0 "$CHANNELS_LOCK_HELPER_PID" 2>/dev/null || break
+    /bin/sleep 0.02
+  done
+  if [ -e "$CHANNELS_LOCK_FAILED" ]; then
+    wait "$CHANNELS_LOCK_HELPER_PID" 2>/dev/null || true
+    CHANNELS_LOCK_HELPER_PID=""
+    rm -f "$CHANNELS_LOCK_FAILED"
+    return 1
+  fi
+  if [ ! -e "$CHANNELS_LOCK_READY" ]; then
+    wait "$CHANNELS_LOCK_HELPER_PID" 2>/dev/null || true
+    CHANNELS_LOCK_HELPER_PID=""
+    echo "ERROR: failed to acquire channels supervisor lock: $CHANNELS_OWNER_FILE" >&2
+    return 2
+  fi
+  rm -f "$CHANNELS_LOCK_READY"
+  trap release_channels_owner EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  # Test-only adversarial seam: kernel ownership is complete before this delay.
+  [ -n "${CHANNELS_TEST_DELAY_AFTER_LOCK:-}" ] && /bin/sleep "$CHANNELS_TEST_DELAY_AFTER_LOCK"
+  return 0
+}
+
 # Self-healing guard: ensure PLUGIN_ID is enabled in the PROJECT settings.json
 # before launch. A PR review-reset or branch-switch that reverts
 # .claude/settings.json can silently drop the entry and disable the channel
@@ -368,7 +483,9 @@ export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HO
 # without AVX. The auto-updater would swap the pin for the latest Bun binary on
 # first run, killing every session -- disable it here so all agent sessions
 # inherit the guard via tmux. No-op on AVX-capable and ARM hosts.
+AVXLESS_X86=false
 if grep -qE '^flags[[:space:]]*:' /proc/cpuinfo 2>/dev/null && ! grep -qiw avx /proc/cpuinfo 2>/dev/null; then
+  AVXLESS_X86=true
   export DISABLE_AUTOUPDATER=1
 fi
 
@@ -385,6 +502,57 @@ CLAUDE="$(command -v claude)"
 TMUX="$(command -v tmux)"
 [ -z "$CLAUDE" ] && echo "ERROR: claude not found on PATH" >&2 && exit 1
 [ -z "$TMUX" ]   && echo "ERROR: tmux not found on PATH" >&2 && exit 1
+
+# Explicit restarts elect exactly one destructive requester with an atomic
+# no-clobber marker. The winner stops the old session, then becomes a normal
+# supervisor and acquires the lifetime lock after the old owner releases it.
+# Concurrent restart commands see the marker and exit without touching the
+# replacement. If the requester dies after publishing, the existing owner
+# still exits when its session is stopped and the service manager consumes the
+# durable marker.
+if [ "$CHANNELS_START_MODE" = "restart" ]; then
+  _restart_identity="$(channels_process_identity "$$")"
+  if [ -n "$_restart_identity" ] \
+      && ( set -C; printf '%s %s %s %s\n' "operator" "$$" "$_restart_identity" "$(date +%s)" > "$CHANNELS_RESTART_INTENT" ) 2>/dev/null; then
+    CHANNELS_OWNS_RESTART_INTENT=true
+    [ -n "${CHANNELS_TEST_DELAY_AFTER_RESTART_ELECTION:-}" ] && /bin/sleep "$CHANNELS_TEST_DELAY_AFTER_RESTART_ELECTION"
+    $TMUX kill-session -t "$SESSION" 2>/dev/null || true
+    CHANNELS_START_MODE="supervise"
+  else
+    exit 0
+  fi
+fi
+
+# A live elected restart requester has priority over automatic service recovery.
+# Service-manager churn must not consume its marker and create a replacement
+# that the still-live winner would immediately replace again.
+if [ "$CHANNELS_OWNS_RESTART_INTENT" != "true" ] \
+    && { [ "$CHANNELS_START_MODE" = "supervise" ] || [ "$CHANNELS_START_MODE" = "service-managed" ]; } \
+    && restart_intent_owner_alive; then
+  exit 0
+fi
+
+# Acquire ownership before any further destructive action. Service and
+# opportunistic starts share this kernel-serialized lifetime ownership.
+if acquire_channels_owner; then
+  :
+else
+  _owner_rc=$?
+  [ "$_owner_rc" = "1" ] && exit 0
+  exit "$_owner_rc"
+fi
+
+# Do not consume a restart request that appeared after this process became the
+# startup owner. Yield the lifetime lock so the elected requester (or the next
+# service-managed recovery) can load fresh state and perform the replacement.
+_CHANNELS_CURRENT_RESTART_INTENT="$(cat "$CHANNELS_RESTART_INTENT" 2>/dev/null || true)"
+if [ "$CHANNELS_OWNS_RESTART_INTENT" != "true" ] \
+    && [ -n "$_CHANNELS_CURRENT_RESTART_INTENT" ] \
+    && [ "$_CHANNELS_CURRENT_RESTART_INTENT" != "$CHANNELS_INITIAL_RESTART_INTENT" ]; then
+  echo "INFO: newer channels restart intent observed after lock acquisition; yielding ownership" >&2
+  exit 1
+fi
+unset _CHANNELS_CURRENT_RESTART_INTENT
 
 # MCP startup-batch tuning for the MAIN session (2026-06-26).
 #
@@ -567,8 +735,54 @@ if command -v node >/dev/null 2>&1; then
   ' 2>/dev/null || true
 fi
 
-# Régi session takarítás
-$TMUX kill-session -t "$SESSION" 2>/dev/null
+# Recheck intent immediately before the create/adopt decision. A marker that
+# appeared since process start belongs to another requester and must remain for
+# that requester/service recovery; never consume it from this older process.
+_CHANNELS_CURRENT_RESTART_INTENT="$(cat "$CHANNELS_RESTART_INTENT" 2>/dev/null || true)"
+if [ "$CHANNELS_OWNS_RESTART_INTENT" != "true" ] \
+    && [ -n "$_CHANNELS_CURRENT_RESTART_INTENT" ] \
+    && [ "$_CHANNELS_CURRENT_RESTART_INTENT" != "$CHANNELS_INITIAL_RESTART_INTENT" ]; then
+  echo "INFO: newer channels restart intent observed before session decision; yielding ownership" >&2
+  exit 1
+fi
+
+# Plugin cache/dependency mutation is serialized by the supervisor lifetime
+# ownership acquired above. Never prepare before the lock: concurrent dashboard,
+# service-manager and operator starts would race npm and .mcp replacement.
+if [ "$AVXLESS_X86" = "true" ] && [ "$CHANNEL_PROVIDER" = "telegram" ]; then
+  TELEGRAM_NODE_RUNTIME="$INSTALL_DIR/scripts/telegram-node-runtime.sh"
+  [ -x "$TELEGRAM_NODE_RUNTIME" ] || { echo "ERROR: AVX-less Telegram runtime helper missing: $TELEGRAM_NODE_RUNTIME" >&2; exit 1; }
+  "$TELEGRAM_NODE_RUNTIME" --prepare || { echo "ERROR: AVX-less Telegram Node runtime preparation failed" >&2; exit 1; }
+fi
+
+# Recheck under the ownership lock. A watchdog marker is a deliberate restart
+# request handed from the exiting supervisor to systemd/launchd. Only normal
+# service supervision consumes it; dashboard create-if-absent calls remain
+# strictly opportunistic and cannot replace any session.
+_watchdog_restart=false
+if { [ "$CHANNELS_START_MODE" = "supervise" ] || [ "$CHANNELS_START_MODE" = "service-managed" ]; } && [ -f "$CHANNELS_RESTART_INTENT" ]; then
+  _watchdog_restart=true
+fi
+if [ "$CHANNELS_START_MODE" = "create-if-absent" ] && [ -f "$CHANNELS_RESTART_INTENT" ]; then
+  exit 0
+fi
+if [ "$CHANNELS_START_MODE" = "create-if-absent" ] && $TMUX has-session -t "$SESSION" 2>/dev/null; then
+  exit 0
+fi
+_channels_create=true
+if [ "$CHANNELS_START_MODE" != "restart" ] && [ "$CHANNELS_START_MODE" != "service-managed" ] && [ "$_watchdog_restart" != "true" ] && $TMUX has-session -t "$SESSION" 2>/dev/null; then
+  _channels_create=false
+fi
+
+if [ "$_channels_create" = "true" ]; then
+if [ "$CHANNELS_START_MODE" = "restart" ] || [ "$CHANNELS_START_MODE" = "service-managed" ] || [ "$_watchdog_restart" = "true" ]; then
+  # The elected operator restart may already have stopped the old session.
+  # A watchdog marker normally leaves it alive, so replace only when present.
+  if $TMUX has-session -t "$SESSION" 2>/dev/null; then
+    $TMUX kill-session -t "$SESSION" 2>/dev/null || true
+  fi
+  rm -f "$CHANNELS_RESTART_INTENT" 2>/dev/null || true
+fi
 
 # Reap orphan main-agent channel pollers (bun/node grandchildren of the
 # previous tmux server). A tmux kill-session does not always tear them down,
@@ -664,13 +878,8 @@ $TMUX set-environment -g CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION false 2>/dev/null 
 # resuming one of those loses the --channels activation state, causing
 # "Channel notifications skipped: server not in --channels list" errors.
 #
-# Idempotent launch: the service runs KillMode=process so a `systemctl stop`
-# no longer cgroup-kills the SHARED tmux server (which would tear down every
-# sibling agent session on this host -- the 2026-06-26 fleet-wide outage). The
-# trade-off is that a prior "$SESSION" can survive into this relaunch, so kill
-# just THIS session first -- never the server, never another agent's session --
-# otherwise new-session below fails with "duplicate session".
-$TMUX kill-session -t "$SESSION" 2>/dev/null || true
+# The replacement decision and any kill happened once under the ownership lock
+# above. Launch exactly one new session here.
 $TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
   "${MCP_BATCH_ENV}${CFG_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}${EXTRA_CHANNELS}"
 
@@ -805,6 +1014,8 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
 #     records whether the plugin actually came up -- a green "firing unlock"
 #     line alone said nothing about whether the fix landed.
 (
+  # The lifetime lock is owned by a dedicated sibling helper, so no lock fd is
+  # present in this background child or in any tmux process it invokes.
   sleep 15
   CLAUDE_PID="$($TMUX list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
   # Check 1: bun grandchild of the marveen-channels claude
@@ -934,8 +1145,12 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
 
 # Bot menu setup (Telegram only; Slack uses App Manifest)
 if [ "$CHANNEL_PROVIDER" = "telegram" ]; then
-  "$INSTALL_DIR/scripts/set-bot-menu.sh" &
+  ( "$INSTALL_DIR/scripts/set-bot-menu.sh" ) &
 fi
+
+fi # _channels_create
+CHANNELS_CREATED_SESSION="$_channels_create"
+unset _channels_create
 
 # Rapid-failure detection: if claude exits within 30s of startup, this is
 # likely a config error (bad token, missing plugin, auth issue). We log the
@@ -1017,6 +1232,17 @@ PLUGIN_DEAD_SINCE=0
 # 2026-08-04: channels.sh logged "exiting for service-manager restart", exited 0,
 # and the unit stayed inactive/dead for the next ten minutes.
 RESTART_REQUESTED=0
+request_service_restart() {
+  # Never overwrite an elected operator marker. Creation is atomic/no-clobber:
+  # if any restart intent already exists, that owner keeps priority and this
+  # watchdog merely exits so the existing protocol can finish.
+  if ( set -C; printf '%s\n' "watchdog $$ $(date +%s)" > "$CHANNELS_RESTART_INTENT" ) 2>/dev/null; then
+    :
+  elif [ ! -f "$CHANNELS_RESTART_INTENT" ]; then
+    echo "ERROR: cannot publish watchdog restart intent: $CHANNELS_RESTART_INTENT" >&2
+  fi
+  RESTART_REQUESTED=1
+}
 
 # Producer-side respawn breadcrumb (SOAKRESPAWN819). The watchdog WARNs below
 # go to stderr, which under systemd lands ONLY in journald -- invisible to
@@ -1047,6 +1273,19 @@ respawn_log() {
 # Várakozás amíg a session él
 while $TMUX has-session -t "$SESSION" 2>/dev/null; do
   sleep 5
+
+  # A separately elected operator restart may have died after publishing intent
+  # but before stopping this session. Observe the durable marker here so the
+  # healthy owner cannot leave all later restart attempts wedged forever.
+  if [ -f "$CHANNELS_RESTART_INTENT" ]; then
+    if restart_intent_owner_alive; then
+      # The elected requester is still responsible for stopping this session.
+      # Do not trigger competing service recovery while it is alive.
+      continue
+    fi
+    RESTART_REQUESTED=1
+    break
+  fi
 
   NOW=$(date +%s)
   _plugin_alive=false
@@ -1088,7 +1327,7 @@ while $TMUX has-session -t "$SESSION" 2>/dev/null; do
     elif [ "$((NOW - PLUGIN_DEAD_SINCE))" -ge "$PLUGIN_DEAD_GRACE" ]; then
       echo "WARN: $CHANNEL_PROVIDER plugin dead for $((NOW - PLUGIN_DEAD_SINCE))s -- exiting for service-manager restart" >&2
       respawn_log "died-after-up: $CHANNEL_PROVIDER plugin dead for $((NOW - PLUGIN_DEAD_SINCE))s -- exiting for service-manager restart"
-      RESTART_REQUESTED=1
+      request_service_restart
       break
     fi
   else
@@ -1102,14 +1341,14 @@ while $TMUX has-session -t "$SESSION" 2>/dev/null; do
       echo "$_next_streak" > "$NEVER_STARTED_STREAK_FILE" 2>/dev/null || true
       echo "WARN: $CHANNEL_PROVIDER plugin never started within ${PLUGIN_NEVER_STARTED_BUDGET}s -- exiting for service-manager restart (consecutive: $_next_streak, next budget: $(never_started_budget "$_next_streak")s)" >&2
       respawn_log "never-started: $CHANNEL_PROVIDER plugin never started within ${PLUGIN_NEVER_STARTED_BUDGET}s (consecutive: $_next_streak, next budget: $(never_started_budget "$_next_streak")s)"
-      RESTART_REQUESTED=1
+      request_service_restart
       break
     fi
   fi
 done
 
 ELAPSED=$(( $(date +%s) - START_TS ))
-if [ "$ELAPSED" -lt 30 ]; then
+if [ "$CHANNELS_CREATED_SESSION" = "true" ] && [ "$ELAPSED" -lt 30 ]; then
   echo "WARN: channels session exited after ${ELAPSED}s (likely config error). Check logs." >&2
   echo "$(date '+%Y-%m-%d %H:%M:%S') rapid-exit after ${ELAPSED}s" >> "$INSTALL_DIR/store/channels-failures.log"
   FAIL_COUNT=$(wc -l < "$INSTALL_DIR/store/channels-failures.log" 2>/dev/null || echo 0)

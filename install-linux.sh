@@ -1734,7 +1734,7 @@ WorkingDirectory=$INSTALL_DIR
 # See the dashboard unit: rebuild the better-sqlite3 native binding if it can't
 # load for the current Node ABI before starting (2026-07-03 crash-loop fix).
 ExecStartPre=$INSTALL_DIR/scripts/ensure-native-modules.sh
-ExecStart=$INSTALL_DIR/scripts/channels.sh
+ExecStart=$INSTALL_DIR/scripts/channels.sh --service-managed
 # Restart=always, NOT on-failure. channels.sh has watchdog branches that exit ON
 # PURPOSE to be restarted (sustained plugin death, plugin never started), and
 # under on-failure a zero exit read as "service finished" and the channel stayed
@@ -1919,7 +1919,7 @@ else
   [ "$(id -u)" = "0" ] && export IS_SANDBOX=1
   nohup "$NODE_PATH" "$INSTALL_DIR/dist/index.js" >"$INSTALL_DIR/store/dashboard.log" 2>&1 &
   echo $! >"$INSTALL_DIR/store/dashboard.pid"
-  nohup bash "$INSTALL_DIR/scripts/channels.sh" >"$INSTALL_DIR/store/channels.log" 2>&1 &
+  nohup bash "$INSTALL_DIR/scripts/channels.sh" --service-managed >"$INSTALL_DIR/store/channels.log" 2>&1 &
   echo $! >"$INSTALL_DIR/store/channels.pid"
   sleep 3
   if kill -0 "$(cat "$INSTALL_DIR/store/dashboard.pid" 2>/dev/null)" 2>/dev/null; then

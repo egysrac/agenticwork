@@ -31,8 +31,11 @@ describe('schedule-runner auto-starts a stopped agent for its scheduled task', (
     expect(guardIdx).toBeGreaterThan(0)
     // Window covering the missing-session block (comment + code, before the
     // real busy-check). Must launch the agent and return the 'starting' state.
-    const missingBlock = SRC.slice(guardIdx, guardIdx + 1800)
+    const busyGuardIdx = SRC.indexOf('if (!task.forceSend', guardIdx)
+    expect(busyGuardIdx).toBeGreaterThan(guardIdx)
+    const missingBlock = SRC.slice(guardIdx, busyGuardIdx)
     expect(missingBlock).toMatch(/startAgentProcess\(agentName\)/)
+    expect(missingBlock).toMatch(/createMainChannelsSession\(\)/)
     expect(missingBlock).toMatch(/return 'starting'/)
   })
 
